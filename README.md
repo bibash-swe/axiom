@@ -10,31 +10,13 @@ This is a from-scratch implementation of the core primitives — outbox pattern,
 
 ## Architecture at a glance
 
-```mermaid
-flowchart TB
-    subgraph T1["Tier 1 · Ingest & Persistence — OLTP hot path"]
-        GW["HTTP Gateway"]
-        PG[("Postgres")]
-        GW --> PG
-    end
+![Axiom System Architecture Blueprint](docs/images/architecture.png)
 
-    subgraph T2["Tier 2 · Transport & Execution — async engine"]
-        RL["Outbox Relay"]
-        RS[["Redis Streams (versioned)"]]
-        WK["Worker Fleet"]
-        RL --> RS --> WK
-    end
-
-    subgraph T3["Tier 3 · Presentation & Anti-Entropy — read model"]
-        RC[("Redis Cache")]
-        JN["Janitor"]
-    end
-
-    PG -.->|dispatch| RL
-    WK -.->|fenced write| PG
-    WK -.->|generation-gated write| RC
-    JN -.->|PEL sweep| RS
-    JN -.->|status check| PG
+Axiom's layout isolates compute from state across a clear 4-tier processing plane to enforce total fault isolation and deterministic recovery loops:
+- **Tier 1 (Ingest & Persistence):** The synchronous boundary where the stateless FastAPI ingress enforces inline idempotency via an atomic `ON CONFLICT DO UPDATE` write to PostgreSQL.
+- **Tier 2 (Transport & Queue):** The asynchronous, non-blocking transit loop where an isolated Outbox Relay pops events using `SKIP LOCKED` and drops them opaquely into Redis Streams.
+- **Tier 3 (Execution Fleet):** The distributed execution engine where horizontal worker nodes pull messages via consumer groups and run long-lived multi-step tasks.
+- **Tier 4 (Control & Anti-Entropy):** A background loop where the Janitor sanitizes dangling or failed states without ever writing directly to the core state machines.
 ```
 
 Postgres is the single source of truth for every workflow's state. Redis is transit and cache — never authoritative. No recovery path in this system trusts a component's own memory of what happened; every one of them re-derives truth from Postgres.
