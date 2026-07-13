@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-axiom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env file — see .env.example}
+      POSTGRES_DB: ${POSTGRES_DB:-axiom}
+    ports:
+      - "5432:5432"
+    volumes:
+      - axiom_pg_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-axiom}"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  axiom_pg_data:
