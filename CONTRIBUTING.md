@@ -4,6 +4,10 @@
 Code documentation explains **behavior**. Types and schemas define **shape**. ADRs define **why**.
 This applies across all languages in this repository (Python, SQL, YAML, etc.).
 
+* **Mechanical Format:** All Python docstrings must pass Ruff's `pydocstyle` (Google convention). This means:
+  1. A one-line summary ending in a period.
+  2. A blank line.
+  3. A terse explanation of behavior (side effects, locks, failure modes).
 * **No Redundancy:** Do not explain standard syntax. If a docstring simply restates the function signature, delete it.
 * **Behavior First:** Docstrings must call out side effects, database locks, idempotency guarantees, and failure modes. 
 * **The Pointer Pattern:** Do not write architectural reasoning inline. Inline comments and docstrings should be terse and point to `docs/decisions.md` (e.g., `see docs/decisions.md #6`) for the underlying justification.
