@@ -8,7 +8,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - axiom_pg_data:/var/lib/postgresql/data
+      - axiom_pg_data:/var/lib/postgresql
       - ./migrations:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-axiom}"]
