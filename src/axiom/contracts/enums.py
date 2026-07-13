@@ -1,5 +1,5 @@
-"""
-Internal workflow state vocabulary and public API mapping.
+"""Internal workflow state vocabulary and public API mapping.
+
 See docs/decisions.md for boundary enforcement reasoning.
 """
 
@@ -7,9 +7,10 @@ from enum import StrEnum
 
 
 class WorkflowStatus(StrEnum):
-    """
-    Workflow state vocabulary. Values are wire contracts stored verbatim
-    in Postgres — never auto(); see docs/decisions.md #6.
+    """Workflow state vocabulary.
+
+    Values are wire contracts stored verbatim in Postgres — never auto();
+    see docs/decisions.md #6.
     """
 
     PENDING = "PENDING"
@@ -24,8 +25,8 @@ class WorkflowStatus(StrEnum):
 
 
 class PublicStatus(StrEnum):
-    """
-    Client-facing state vocabulary.
+    """Client-facing state vocabulary.
+
     Excludes internal infrastructure failure modes like DEAD_LETTERED.
     """
 
