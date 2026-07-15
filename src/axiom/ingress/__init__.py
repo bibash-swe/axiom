@@ -1,0 +1,1 @@
+"""External HTTP gateway and request validation layer."""
