@@ -17,5 +17,5 @@ class WorkflowStartedEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    event_type: Literal["WorkflowStarted"] = "WorkflowStarted"
+    event_type: Literal["WORKFLOW_STARTED"] = "WORKFLOW_STARTED"
     workflow_id: UUID

@@ -1,5 +1,7 @@
 """Shared fixtures for the test suite."""
 
+from collections.abc import AsyncGenerator
+
 import asyncpg
 import pytest_asyncio
 
@@ -7,11 +9,11 @@ from axiom.config import settings
 
 
 @pytest_asyncio.fixture
-async def pool():
+async def pool() -> AsyncGenerator[asyncpg.Pool, None]:
     """A real asyncpg pool against the real local Postgres — never mocked.
 
-    max_size=20: the concurrent-race tests fire 10+ simultaneous requests:
-    a pool smaller than that would serialize some of them at the client
+    max_size=20: the concurrent-race tests fire 10+ simultaneous requests.
+    A pool smaller than that would serialize some of them at the client
     level, which doesn't invalidate the DB-side atomicity guarantee being
     tested, but does weaken how much real concurrency the test exercises.
     """

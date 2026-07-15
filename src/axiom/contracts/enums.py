@@ -48,4 +48,6 @@ INTERNAL_TO_PUBLIC_STATUS: dict[WorkflowStatus, PublicStatus] = {
     WorkflowStatus.COMPLETED: PublicStatus.SUCCEEDED,
     WorkflowStatus.FAILED: PublicStatus.FAILED,
     WorkflowStatus.CANCELED: PublicStatus.CANCELED,
+    WorkflowStatus.DISPATCH_FAILED: PublicStatus.FAILED,
+    WorkflowStatus.DEAD_LETTERED: PublicStatus.FAILED,
 }
