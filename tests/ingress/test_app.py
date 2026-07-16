@@ -12,10 +12,10 @@ from axiom.ingress.app import _get_pool, app
 
 @pytest_asyncio.fixture
 async def client(pool: asyncpg.Pool) -> AsyncIterator[AsyncClient]:
-    """A httpx client wired directly to the real pool fixture via dependency override.
+    """An httpx client wired to the real pool fixture via dependency override.
 
-    Bypasses the app's own lifespan-managed pool entirely, so
-    tests don't depend on startup/shutdown timing.
+    Bypasses the app's own lifespan-managed pool entirely, so tests don't
+    depend on startup/shutdown timing.
     """
     app.dependency_overrides[_get_pool] = lambda: pool
     transport = ASGITransport(app=app)
@@ -56,7 +56,7 @@ async def test_create_workflow_replay_returns_same_id(client: AsyncClient) -> No
 
 
 async def test_create_workflow_rejects_blank_idempotency_key(client: AsyncClient) -> None:
-    """Whitespace-only idempotency_key fails schema validation, not just min_length."""
+    """Whitespace-only idempotency_key fails the schema's own validator, not just min_length."""
     resp = await client.post(
         "/workflows",
         json={"workflow_type": "x", "idempotency_key": "   ", "input_data": {}},
