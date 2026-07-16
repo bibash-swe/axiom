@@ -37,9 +37,9 @@ Built in verified layers — nothing in a later phase is trusted until the layer
 
 | Phase | Component | Status |
 |---|---|---|
-| 0 | Project scaffolding, tooling, `contracts/` boundary | 🟡 In progress |
-| 1 | Schema + Ingress (atomic idempotent write) | 🟡 In progress |
-| 2 | Outbox Relay + versioned Redis Streams | ⬜ Not started |
+| 0 | Project scaffolding, tooling, `contracts/` boundary | ✅ Done |
+| 1 | Schema + Ingress (atomic idempotent write) | ✅ Done |
+| 2 | Outbox Relay + versioned Redis Streams | 🟡 In progress |
 | 3 | Worker Fleet (claim, fencing, heartbeat, cost-safety abort) | ⬜ Not started |
 | 4 | Cache Projection + Janitor + retry scheduler | ⬜ Not started |
 | 5 | API layer (status, cancellation, human-in-the-loop resume) | ⬜ Not started |

@@ -9,7 +9,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "asyncpg>=0.29",
     "pydantic>=2.9",
-    "redis>=5.0",
+    "redis>=8.0.1",
     "pydantic-settings>=2.14.2",
 ]
 

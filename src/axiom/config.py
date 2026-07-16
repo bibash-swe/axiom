@@ -4,21 +4,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed access to the environment configuration."""
+    """Typed, validated access to the environment configuration currently consumed by real code."""
+
+    model_config = SettingsConfigDict(env_prefix="AXIOM_", env_file=".env", extra="ignore")
 
     database_url: str = "postgresql://axiom:axiom_dev@localhost:5432/axiom"
+    redis_url: str = "redis://localhost:6379/0"
 
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
 
-    log_level: str = "INFO"
+    relay_batch_size: int = 100
+    relay_claim_lease_seconds: int = 30
+    relay_redis_socket_timeout_seconds: int = 1
+    relay_max_retries: int = 5
 
+    log_level: str = "INFO"
     env: str = "development"
 
-    model_config = SettingsConfigDict(
-        env_prefix="AXIOM_",
-        env_file=".env",
-        extra="ignore"
-    )
 
 settings = Settings()
