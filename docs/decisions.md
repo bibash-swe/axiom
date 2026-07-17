@@ -252,6 +252,23 @@ fall back quietly.
 
 ---
 
+## 12. Relay poll interval: 100ms, not a full second
+
+**Decision:** `AXIOM_RELAY_POLL_INTERVAL_SECONDS = 0.1`, checked on every
+idle cycle of the Relay's run loop.
+
+**Why:** An empty `SELECT ... FOR UPDATE SKIP LOCKED` against
+`idx_outbox_undispatched` is trivially cheap even at high frequency — a
+partial index scan that returns nothing costs sub-millisecond, so there's
+no real Postgres-load argument for polling slowly. Against that near-zero
+cost, tighter polling buys strictly better, more deterministic dispatch
+latency for free. This number isn't new — it was committed to during the
+original design discussion, before any code existed — but the first
+concrete implementation of the run loop briefly drifted to 1 second with
+no cost-based justification, simply because no one had gone back and
+checked the number against the original reasoning. Written down explicitly
+here specifically so that doesn't happen silently again.
+
 ## Known open items
 
 - **SQL/Python drift risk:** nothing currently enforces that the
