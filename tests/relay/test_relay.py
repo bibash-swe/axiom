@@ -1,6 +1,6 @@
 """Tests for the Outbox Relay's claim/publish/settle logic."""
 
-import json
+from collections.abc import Awaitable, Callable
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -14,49 +14,35 @@ from axiom.relay.relay import (
     settle_success,
 )
 
-
-async def _make_outbox_row(
-    pool: asyncpg.Pool, *, idempotency_key: str, workflow_version: str
-) -> tuple[UUID, UUID]:
-    """Create a workflow_states row and its corresponding, undispatched outbox row."""
-    async with pool.acquire() as conn:
-        workflow_id = await conn.fetchval(
-            "INSERT INTO workflow_states (workflow_type, workflow_version, idempotency_key) "
-            "VALUES ('test_type', $1, $2) RETURNING id",
-            workflow_version,
-            idempotency_key,
-        )
-        outbox_id = await conn.fetchval(
-            "INSERT INTO workflow_outbox (workflow_id, event_type, payload, workflow_version) "
-            "VALUES ($1, 'WORKFLOW_STARTED', $2::jsonb, $3) RETURNING id",
-            workflow_id,
-            json.dumps({"event_type": "WORKFLOW_STARTED", "workflow_id": str(workflow_id)}),
-            workflow_version,
-        )
-    return workflow_id, outbox_id
+MakeOutboxRow = Callable[..., Awaitable[tuple[UUID, UUID]]]
 
 
-async def test_claim_batch_claims_undispatched_rows(pool: asyncpg.Pool) -> None:
+async def test_claim_batch_claims_undispatched_rows(
+    pool: asyncpg.Pool, make_outbox_row: MakeOutboxRow
+) -> None:
     """A fresh, undispatched row is claimable, and reports the right fields."""
     version = f"test_{uuid4().hex[:8]}"
-    workflow_id, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    workflow_id, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
 
     claimed = await claim_batch(
         pool, instance_id=uuid4(), batch_size=100, claim_lease_seconds=30, max_retries=5
     )
     mine = [c for c in claimed if c.workflow_version == version]
+
     assert len(mine) == 1
     assert mine[0].id == outbox_id
     assert mine[0].workflow_id == workflow_id
 
 
-async def test_claim_batch_respects_active_claim_lease(pool: asyncpg.Pool) -> None:
+async def test_claim_batch_respects_active_claim_lease(
+    pool: asyncpg.Pool, make_outbox_row: MakeOutboxRow
+) -> None:
     """A row claimed with a fresh lease is invisible to a second claimant."""
     version = f"test_{uuid4().hex[:8]}"
-    _, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    _, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
 
     first = await claim_batch(
@@ -71,12 +57,12 @@ async def test_claim_batch_respects_active_claim_lease(pool: asyncpg.Pool) -> No
 
 
 async def test_publish_batch_routes_to_version_specific_stream(
-    pool: asyncpg.Pool, redis_client: Redis
+    pool: asyncpg.Pool, redis_client: Redis, make_outbox_row: MakeOutboxRow
 ) -> None:
     """Each row's payload lands opaquely in workflow_stream_{its own version}."""
     version = f"test_{uuid4().hex[:8]}"
-    _, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    _, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
 
     claimed = await claim_batch(
@@ -91,12 +77,12 @@ async def test_publish_batch_routes_to_version_specific_stream(
 
 
 async def test_settle_success_marks_dispatched_and_releases_claim(
-    pool: asyncpg.Pool, redis_client: Redis
+    pool: asyncpg.Pool, redis_client: Redis, make_outbox_row: MakeOutboxRow
 ) -> None:
     """A settled row is dispatched, claim-free, and excluded from future claims."""
     version = f"test_{uuid4().hex[:8]}"
-    _, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    _, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
     instance_a = uuid4()
 
@@ -121,11 +107,13 @@ async def test_settle_success_marks_dispatched_and_releases_claim(
     assert outbox_id not in [c.id for c in reclaim]
 
 
-async def test_settle_success_respects_claimed_by_ownership(pool: asyncpg.Pool) -> None:
+async def test_settle_success_respects_claimed_by_ownership(
+    pool: asyncpg.Pool, make_outbox_row: MakeOutboxRow
+) -> None:
     """A settlement attempt from the wrong instance must be a no-op."""
     version = f"test_{uuid4().hex[:8]}"
-    _, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    _, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
 
     claimed = await claim_batch(
@@ -143,12 +131,12 @@ async def test_settle_success_respects_claimed_by_ownership(pool: asyncpg.Pool) 
 
 
 async def test_settle_failures_increments_retry_without_dead_lettering(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool, make_outbox_row: MakeOutboxRow
 ) -> None:
     """A single failure releases the claim and bumps retry_count, but stays PENDING."""
     version = f"test_{uuid4().hex[:8]}"
-    workflow_id, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    workflow_id, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
     instance_a = uuid4()
 
@@ -174,11 +162,13 @@ async def test_settle_failures_increments_retry_without_dead_lettering(
     assert state_row["status"] == "PENDING"
 
 
-async def test_settle_failures_dead_letters_at_max_retries(pool: asyncpg.Pool) -> None:
+async def test_settle_failures_dead_letters_at_max_retries(
+    pool: asyncpg.Pool, make_outbox_row: MakeOutboxRow
+) -> None:
     """Repeated failures dead-letter the workflow — exactly at the threshold, not before."""
     version = f"test_{uuid4().hex[:8]}"
-    workflow_id, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    workflow_id, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
     instance_a = uuid4()
     max_retries = 3
@@ -220,12 +210,12 @@ async def test_settle_failures_dead_letters_at_max_retries(pool: asyncpg.Pool) -
 
 
 async def test_run_relay_cycle_processes_and_reports_count(
-    pool: asyncpg.Pool, redis_client: Redis
+    pool: asyncpg.Pool, redis_client: Redis, make_outbox_row: MakeOutboxRow
 ) -> None:
     """A full cycle dispatches a pending row; an idle cycle correctly reports zero."""
     version = f"test_{uuid4().hex[:8]}"
-    _, outbox_id = await _make_outbox_row(
-        pool, idempotency_key=f"k_{uuid4()}", workflow_version=version
+    _, outbox_id = await make_outbox_row(
+        idempotency_key=f"k_{uuid4()}", workflow_version=version
     )
     instance_a = uuid4()
 
