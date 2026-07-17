@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     relay_claim_lease_seconds: int = 30
     relay_redis_socket_timeout_seconds: int = 1
     relay_max_retries: int = 5
+    relay_poll_interval_seconds: float = 0.1
 
     log_level: str = "INFO"
     env: str = "development"
