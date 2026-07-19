@@ -1,0 +1,1 @@
+"""The Worker — consumes stream messages and executes workflows under strict lease fencing."""

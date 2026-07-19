@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     relay_max_retries: int = 5
     relay_poll_interval_seconds: float = 0.1
 
+    worker_lease_seconds: int = 30
+    worker_heartbeat_interval_seconds: int = 10
+    worker_xautoclaim_min_idle_seconds: int = 35
+    worker_max_retries: int = 5
+    worker_batch_size: int = 10
+
+
     log_level: str = "INFO"
     env: str = "development"
 
