@@ -278,3 +278,13 @@ here specifically so that doesn't happen silently again.
   Belongs in `tests/contracts/` once that exists.
 - **Exhaustiveness of `INTERNAL_TO_PUBLIC_STATUS`:** same category of
   gap — verified once by hand, not yet a standing test.
+- **Poison-pilled outbox rows have no retention path:** Once `retry_count` 
+  crosses `max_retries`, a `workflow_outbox` row sits permanently at 
+  `dispatched = FALSE`, correctly excluded from all future claims, but 
+  nothing ever archives or deletes it. The original outbox retention job 
+  (see the early design notes) only ever covered `dispatched = TRUE`. The 
+  fix is to widen that job's filter to 
+  `WHERE dispatched = TRUE OR retry_count >= max_retries`, not to touch 
+  `relay.py` — `dispatched` must keep meaning "this actually reached 
+  Redis," never "we gave up." Low urgency (poison-pills should be rare 
+  in a healthy system) but a real gap, not yet built.
