@@ -35,12 +35,12 @@ Postgres is the single source of truth for every workflow's state. Redis is tran
 
 Built in verified layers — nothing in a later phase is trusted until the layer beneath it has real, passing tests against a real Postgres and Redis, not mocks.
 
-| Phase | Component | Status |
-|---|---|---|
-| 0 | Project scaffolding, tooling, `contracts/` boundary | ✅ Done |
-| 1 | Schema + Ingress (atomic idempotent write) | ✅ Done |
-| 2 | Outbox Relay + versioned Redis Streams | 🟡 In progress |
-| 3 | Worker Fleet (claim, fencing, heartbeat, cost-safety abort) | ⬜ Not started |
+| Phase | Component | Status        |
+|---|---|---------------|
+| 0 | Project scaffolding, tooling, `contracts/` boundary | ✅ Done        |
+| 1 | Schema + Ingress (atomic idempotent write) | ✅ Done        |
+| 2 | Outbox Relay + versioned Redis Streams | ✅ Done        |
+| 3 | Worker Fleet (claim, fencing, heartbeat, cost-safety abort) | ✅ Done        |
 | 4 | Cache Projection + Janitor + retry scheduler | ⬜ Not started |
 | 5 | API layer (status, cancellation, human-in-the-loop resume) | ⬜ Not started |
 | 6 | Observability (metrics, alert thresholds, runbooks) | ⬜ Not started |

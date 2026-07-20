@@ -75,14 +75,14 @@ def make_workflow_row(pool: asyncpg.Pool) -> Callable[..., Awaitable[UUID]]:
     """
 
     async def _make(
-        *,
-        idempotency_key: str,
-        workflow_type: str = "test_type",
-        workflow_version: str = "v1",
-        input_data: dict[str, Any] | None = None,
-        status: str = "PENDING",
-        lease_generation: int = 0,
-        lease_stale: bool = False,
+            *,
+            idempotency_key: str,
+            workflow_type: str = "test_type",
+            workflow_version: str = "v1",
+            input_data: dict[str, Any] | None = None,
+            status: str = "PENDING",
+            lease_generation: int = 0,
+            lease_stale: bool = False,
     ) -> UUID:
         async with pool.acquire() as conn:
             if status == "PENDING":
@@ -125,20 +125,21 @@ def make_workflow_row(pool: asyncpg.Pool) -> Callable[..., Awaitable[UUID]]:
 
 @pytest.fixture
 def dispatch_workflow(
-    pool: asyncpg.Pool, redis_client: Redis
+        pool: asyncpg.Pool, redis_client: Redis
 ) -> Callable[..., Awaitable[UUID]]:
-    """Factory fixture: creates a PENDING row and pushes its WorkflowStartedEvent.
+    """Factory fixture creating a PENDING row plus its dispatch event.
 
-    It pushes onto the given stream — the same shape the Relay produces, letting runner
-    tests exercise the real consumption path end to end.
+    Pushes a WorkflowStartedEvent onto the given stream — the same shape
+    the Relay produces, letting runner tests exercise the real
+    consumption path end to end.
     """
 
     async def _dispatch(
-        *,
-        stream_name: str,
-        workflow_type: str,
-        input_data: dict[str, Any] | None = None,
-        idempotency_key: str | None = None,
+            *,
+            stream_name: str,
+            workflow_type: str,
+            input_data: dict[str, Any] | None = None,
+            idempotency_key: str | None = None,
     ) -> UUID:
         async with pool.acquire() as conn:
             workflow_id = cast(
