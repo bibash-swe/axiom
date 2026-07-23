@@ -269,15 +269,42 @@ no cost-based justification, simply because no one had gone back and
 checked the number against the original reasoning. Written down explicitly
 here specifically so that doesn't happen silently again.
 
-## Known open items
+## 13. Execution model: atomic steps, composed — not intra-step replay
 
-- **SQL/Python drift risk:** nothing currently enforces that the
-  `chk_status` constraint in `001_initial_schema.sql` and
-  `WorkflowStatus` in `enums.py` stay in sync. Verified equal once, by
-  hand, via a live query against the constraint — not yet a real test.
-  Belongs in `tests/contracts/` once that exists.
-- **Exhaustiveness of `INTERNAL_TO_PUBLIC_STATUS`:** same category of
-  gap — verified once by hand, not yet a standing test.
+**Decision:** A reclaimed workflow re-runs its handler from the start;
+there is no checkpointing of partial progress within a single
+`workflow_states` row. A multi-step agentic workflow is modeled as a
+*chain* of separate Axiom workflow rows — the output of step N becomes
+part of step N+1's input, dispatched as its own outbox event — not as
+one workflow with internal event-sourced replay.
+
+**Why:** This was already true of the code; it just hadn't been decided
+on purpose. The alternative — Temporal-style replay, reconstructing
+exact intermediate state from an event log — is a substantially larger
+mechanism we haven't built and don't need for the guarantee this system
+actually promises. DBOS is a real, production precedent for the same
+choice: their workflows resume "from the last completed step," with
+each `@DBOS.step()` checkpointed atomically and no finer-grained replay
+within a step. Deciding this now, cheaply, rather than leaving it
+implicit into Phase 5, where "human-in-the-loop resume" would otherwise
+have to guess at a semantics nobody actually chose.
+
+## 14. LISTEN/NOTIFY considered for Relay dispatch, deferred
+
+**Decision:** The Relay keeps polling (100ms, per decision 12) as the
+sole dispatch-wakeup mechanism. `LISTEN`/`NOTIFY` was not adopted.
+
+**Why:** Postgres `NOTIFY` is not durable — a listener disconnected at
+the exact moment a notification fires loses it permanently, with
+nothing queued for later delivery. That means `NOTIFY` could only ever
+be a fast-path wakeup layered on top of the existing poll as a
+durability backstop, never a replacement for it. Worth revisiting if
+dispatch latency ever becomes a measured problem, but the poll's latency
+floor is already immaterial against workflow durations measured in
+seconds to minutes, so the added complexity (trigger management,
+listener reconnection handling) isn't justified by the win today.
+
+## Known open items
 - **Poison-pilled outbox rows have no retention path:** Once `retry_count` 
   crosses `max_retries`, a `workflow_outbox` row sits permanently at 
   `dispatched = FALSE`, correctly excluded from all future claims, but 
@@ -288,3 +315,18 @@ here specifically so that doesn't happen silently again.
   `relay.py` — `dispatched` must keep meaning "this actually reached 
   Redis," never "we gave up." Low urgency (poison-pills should be rare 
   in a healthy system) but a real gap, not yet built.
+- **`stream_guard()`'s per-chunk check has never been load-tested at
+  realistic LLM token rates.** The abort mechanism is proven correct
+  (a concurrent test confirms it fires precisely between chunks), but
+  its overhead — a Postgres round-trip per yielded item — has only been
+  tested against a synthetic 5-item generator, not against something
+  simulating 50-100 tokens/sec. At that rate, multiplied across
+  concurrently-streaming workers, this could become real read load with
+  no measurement backing the assumption that it's fine.
+- **Heartbeat timing has never been tested under realistic concurrent
+  process pressure.** The 10s heartbeat / 30s lease ratio gives a 3x
+  margin against a single missed tick, but that ratio was chosen for
+  clean divisibility, not deliberately reasoned about against GC pauses
+  or GIL contention under load — both plausible causes of a
+  false-positive fencing event that would be self-inflicted rather than
+  infrastructure-caused.
