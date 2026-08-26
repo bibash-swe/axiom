@@ -2,7 +2,7 @@
 
 **A distributed, fault-tolerant orchestration engine for long-running AI workflows.**
 
-Axiom exists for one specific, expensive problem: durable execution of multi-step LLM workflows where a crash, a network blip, or a superseded worker must never mean lost state, a duplicated side effect, or — worst case — a duplicated LLM bill. Every mechanism here is built and tested against that guarantee, not bolted on after the fact.
+Axiom exists for one specific, expensive problem: durable execution of multi-step LLM workflows where a crash, a network blip, or a superseded worker must never mean lost state, a duplicated side effect, or — worst case — a duplicated LLM bill. Every mechanism that exists here was built and tested against that guarantee rather than bolted on afterwards — and the parts not yet built are marked as such below rather than quietly implied.
 
 This is a from-scratch implementation of the core primitives — outbox pattern, fencing tokens, lease-based reclaim, anti-entropy reconciliation — not a wrapper around an existing durable-execution platform. Temporal, Restate, and Inngest all solve versions of this problem well; the honest reasoning for building this instead of adopting one of them lives in [`docs/decisions.md`](docs/decisions.md), not in marketing copy here.
 
@@ -16,18 +16,53 @@ Axiom's layout isolates compute from state across a clear 4-tier processing plan
 - **Tier 1 (Ingest & Persistence):** The synchronous boundary where the stateless FastAPI ingress enforces inline idempotency via an atomic `ON CONFLICT DO UPDATE` write to PostgreSQL.
 - **Tier 2 (Transport & Queue):** The asynchronous, non-blocking transit loop where an isolated Outbox Relay pops events using `SKIP LOCKED` and drops them opaquely into Redis Streams.
 - **Tier 3 (Execution Fleet):** The distributed execution engine where horizontal worker nodes pull messages via consumer groups and run long-lived multi-step tasks.
-- **Tier 4 (Control & Anti-Entropy):** A background loop where the Janitor sanitizes dangling or failed states without ever writing directly to the core state machines.
+- **Tier 4 (Control & Anti-Entropy)** — *specified, not yet built:* A background loop where the Janitor will sanitize dangling or failed states without ever writing directly to the core state machines.
 
 Postgres is the single source of truth for every workflow's state. Redis is transit and cache — never authoritative. No recovery path in this system trusts a component's own memory of what happened; every one of them re-derives truth from Postgres.
 
 ---
 
-## What this actually guarantees
+## What this guarantees — and how far it's actually proven
 
-- **Exactly-once-effective execution, verified, not assumed.** Every worker claim uses `SELECT ... FOR UPDATE SKIP LOCKED` plus a fencing token (`lease_generation`) that makes a superseded worker's final write a guaranteed no-op — checked with a concurrent-claim test against a real Postgres instance, not just argued in a design doc.
-- **Cost-safety as a first-class guarantee.** A worker that's been superseded mid-LLM-call is expected to detect it and abort the connection before the next token generates. A duplicated correctness bug is bad; a duplicated LLM bill is the one that gets escalated.
-- **Anti-entropy instead of "it shouldn't happen."** A dedicated reconciliation sweep exists specifically because ACKs, cache writes, and status transitions can each independently fail. The system assumes partial failure at every boundary rather than hoping around it.
-- **Cordon-and-drain versioning**, so a breaking workflow schema change doesn't require stopping the world — old and new workflow versions run side by side until the old version's in-flight jobs drain naturally.
+Each entry is a design target followed by its real status. A project whose
+thesis is "verified, not assumed" cannot have a front page that asserts
+mechanisms it has not built, so the two are kept separate here rather than
+blurred into one confident paragraph.
+
+**✅ Exactly-once-effective execution — built and verified.**
+Fencing is via `lease_generation`, enforced *at the row*: a superseded worker's
+write carries a stale generation, matches zero rows, and is a guaranteed no-op.
+The Worker's claim is a single-row conditional `UPDATE`, which deliberately does
+**not** use `SKIP LOCKED` — under Read Committed, a blocked `UPDATE` re-evaluates
+its `WHERE` clause once the competing transaction commits, so the loser correctly
+affects zero rows on its own. `SELECT ... FOR UPDATE SKIP LOCKED` is used by the
+Relay's *batch* claim, where many candidate rows are scanned. Both are checked by
+concurrent tests against a real Postgres instance.
+
+**⚠️ Cost-safety — mechanism proven, provider behavior not.**
+A superseded worker detects supersession between stream chunks and closes the
+transport. That much is proven: measured against a real socket and observed from
+the *server's* side, the close lands before the fencing error even surfaces.
+
+Two things are explicitly **not** established, and are not claimed:
+- Whether a given LLM provider actually stops generating — and stops billing —
+  once we disconnect. That is a property of someone else's infrastructure, it
+  varies by provider, and it is only measurable per-provider against a real one.
+- Fencing does **not** stop a *reclaiming* worker from issuing a second paid
+  call. Because a reclaimed workflow re-runs its handler from the start (see
+  `docs/decisions.md` #13), a stalled-then-reclaimed workflow can bill twice.
+  Closing that gap requires provider-side idempotency keys on egress, which are
+  not yet implemented.
+
+**⬜ Anti-entropy — designed, not built (Phase 4).**
+The reconciliation sweep is specified, and deliberately scoped so the Janitor
+never writes `workflow_states` at all — its only power is force-`ACK`ing a Redis
+entry whose row is *already* terminal. `src/axiom/janitor/` is currently empty.
+
+**⬜ Cordon-and-drain versioning — schema only (Phase 4+).**
+`workflow_versions` exists with `cordoned_at`/`decommissioned_at`, and streams
+are already version-routed (`workflow_stream_{version}`). Nothing reads cordon
+state yet, so no version can currently be cordoned.
 
 ---
 
@@ -97,4 +132,4 @@ axiom/
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). *(Not yet added to the repo — this is a proposed default, not a settled decision.)*
+MIT — see [`LICENSE`](LICENSE).
