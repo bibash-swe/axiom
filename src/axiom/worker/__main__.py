@@ -46,6 +46,8 @@ async def _main(stream_version: str) -> None:
             heartbeat_interval_seconds=settings.worker_heartbeat_interval_seconds,
             xautoclaim_min_idle_seconds=settings.worker_xautoclaim_min_idle_seconds,
             max_retries=settings.worker_max_retries,
+            retry_base_seconds=settings.worker_retry_base_seconds,
+            retry_cap_seconds=settings.worker_retry_cap_seconds,
             batch_size=settings.worker_batch_size,
             shutdown_event=shutdown_event,
         )

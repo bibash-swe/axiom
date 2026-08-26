@@ -15,6 +15,8 @@ from redis.asyncio import Redis
 
 # Claim: short transaction, released immediately. retry_count < $2 is the
 # poison-pill enforcement point; claimed_at staleness is the lease.
+# available_at gates rows a worker has scheduled for a later retry — see
+# schedule_retry() in worker/worker.py. Fresh dispatches default to now().
 _CLAIM_BATCH = """
     UPDATE workflow_outbox
     SET claimed_at = NOW(), claimed_by = $1
@@ -22,6 +24,7 @@ _CLAIM_BATCH = """
         SELECT id FROM workflow_outbox
         WHERE dispatched = FALSE
           AND retry_count < $2
+          AND available_at <= NOW()
           AND (claimed_at IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
         ORDER BY created_at ASC
         LIMIT $4

@@ -20,6 +20,7 @@ gets redelivered to whoever holds the current lease.
 
 import asyncio
 import logging
+import random
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any
 from uuid import UUID
@@ -39,6 +40,37 @@ class WorkerFencedError(Exception):
     required response is identical: abandon execution, do not settle, do
     not ack.
     """
+
+
+class NonRetryableError(Exception):
+    """A handler failure that will fail identically every time. Do not retry.
+
+    Handlers raise this (or wrap in it) for genuinely permanent conditions:
+    malformed input, a rejected prompt, a 400 from a provider. Everything
+    else a handler raises is retried, because the failures that dominate
+    this workload — 429s, 503s, timeouts, dropped connections — are
+    transient, and defaulting to "give up" would make a durable execution
+    engine surrender on exactly the errors it exists to survive.
+
+    The cost of that default is bounded: a deterministic bug is retried
+    max_retries times and then dead-lettered, not forever.
+    """
+
+
+def retry_delay_seconds(attempt: int, *, base_seconds: float, cap_seconds: float) -> float:
+    """Full-jitter exponential backoff for the given 1-based attempt number.
+
+    delay = uniform(0, min(cap, base * 2^(attempt-1))).
+
+    Full jitter rather than plain exponential because the interesting
+    failure here is correlated: a provider outage fails every in-flight
+    workflow at once, and un-jittered backoff would have them all return
+    together, repeatedly, hammering a service that is trying to recover.
+    Spreading uniformly across the whole window is what actually decorrelates
+    them.
+    """
+    ceiling = min(cap_seconds, base_seconds * (2 ** max(0, attempt - 1)))
+    return random.uniform(0, ceiling)
 
 
 async def _heartbeat_loop(

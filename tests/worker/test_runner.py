@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import asyncpg
 from redis.asyncio import Redis
 
+from axiom.worker.execution import NonRetryableError
 from axiom.worker.runner import HandlerRegistry, run_forever
 
 DispatchWorkflow = Callable[..., Awaitable[UUID]]
@@ -24,6 +25,12 @@ async def _failing_handler(
     pool: asyncpg.Pool, workflow_id: UUID, generation: int, input_data: dict[str, Any]
 ) -> dict[str, Any]:
     raise ValueError("deliberate handler failure")
+
+
+async def _permanent_handler(
+    pool: asyncpg.Pool, workflow_id: UUID, generation: int, input_data: dict[str, Any]
+) -> dict[str, Any]:
+    raise NonRetryableError("deliberate permanent failure")
 
 
 async def _run_briefly(
@@ -48,6 +55,8 @@ async def _run_briefly(
             heartbeat_interval_seconds=10,
             xautoclaim_min_idle_seconds=35,
             max_retries=5,
+            retry_base_seconds=0.01,
+            retry_cap_seconds=0.01,
             batch_size=10,
             shutdown_event=shutdown,
         )
@@ -96,10 +105,15 @@ async def test_unregistered_workflow_type_fails_and_acks(
     assert pending["pending"] == 0
 
 
-async def test_handler_exception_fails_and_acks(
+async def test_handler_exception_releases_for_retry_and_acks(
     pool: asyncpg.Pool, redis_client: Redis, dispatch_workflow: DispatchWorkflow
 ) -> None:
-    """A handler that raises is caught, recorded, and still acked — not left hanging."""
+    """A handler that raises is caught, released back to PENDING, redispatched, and acked.
+
+    An ordinary exception is assumed transient — the failures that dominate
+    this workload are. The current message is acked because the retry
+    arrives as a new one; see test_retry.py for the full round trip.
+    """
     stream = f"workflow_stream_test_{uuid4().hex[:8]}"
     wid = await dispatch_workflow(stream_name=stream, workflow_type="always_fails")
 
@@ -109,11 +123,44 @@ async def test_handler_exception_fails_and_acks(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT status, error_log FROM workflow_states WHERE id = $1", wid
+            "SELECT status, error_log, worker_id, lease_expires_at "
+            "FROM workflow_states WHERE id = $1",
+            wid,
+        )
+        redispatches = await conn.fetchval(
+            "SELECT count(*) FROM workflow_outbox WHERE workflow_id = $1", wid
+        )
+    assert row is not None
+    assert row["status"] == "PENDING"
+    assert "deliberate handler failure" in row["error_log"]
+    # Ownership is released along with the status, or nothing else could claim it.
+    assert row["worker_id"] is None
+    assert row["lease_expires_at"] is None
+    assert redispatches == 1
+
+    pending = await redis_client.xpending(stream, "workers")
+    assert pending["pending"] == 0
+
+
+async def test_non_retryable_handler_exception_is_terminal_and_acks(
+    pool: asyncpg.Pool, redis_client: Redis, dispatch_workflow: DispatchWorkflow
+) -> None:
+    """NonRetryableError settles FAILED with no redispatch — the opt-out path."""
+    stream = f"workflow_stream_test_{uuid4().hex[:8]}"
+    wid = await dispatch_workflow(stream_name=stream, workflow_type="permanent")
+
+    await _run_briefly(
+        pool, redis_client, stream_name=stream, handlers={"permanent": _permanent_handler}
+    )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT status FROM workflow_states WHERE id = $1", wid)
+        redispatches = await conn.fetchval(
+            "SELECT count(*) FROM workflow_outbox WHERE workflow_id = $1", wid
         )
     assert row is not None
     assert row["status"] == "FAILED"
-    assert "deliberate handler failure" in row["error_log"]
+    assert redispatches == 0
 
     pending = await redis_client.xpending(stream, "workers")
     assert pending["pending"] == 0

@@ -95,6 +95,8 @@ async def _run_until_done(
             heartbeat_interval_seconds=10,
             xautoclaim_min_idle_seconds=35,
             max_retries=5,
+            retry_base_seconds=0.01,
+            retry_cap_seconds=0.01,
             batch_size=10,
             shutdown_event=shutdown,
         )
