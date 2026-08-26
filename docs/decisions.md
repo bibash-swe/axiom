@@ -304,6 +304,89 @@ floor is already immaterial against workflow durations measured in
 seconds to minutes, so the added complexity (trigger management,
 listener reconnection handling) isn't justified by the win today.
 
+## 15. Provider-side cancellation: measured for Mistral, unproven elsewhere
+
+**Decision:** The cost-safety guarantee is stated *per provider*, and only
+for a provider a probe has actually been run against. For Mistral
+(`mistral-small-latest`, standard tier, August 2026), disconnecting does
+prevent generation continuing to `max_tokens`. That is recorded here as a
+dated measurement with a scope, not promoted into a property of the system.
+
+**Why this needed measuring at all:** `stream_guard` closing the socket is
+entirely within our control and is proven — see
+`tests/worker/test_transport_cancellation.py`, which observes the close from
+the server's side. Whether the *provider* stops generating, and stops
+billing, once that socket closes is a property of someone else's
+infrastructure. No test of our own code can establish it, and the README
+previously asserted it anyway.
+
+**The instrument, and two flaws that would have made the answer worthless.**
+The only client-visible cost oracle Mistral exposes is the rate-limit token
+budget. Two controls were run before trusting it, and both mattered:
+
+1. *Does the limiter debit actual usage, or reserve `max_tokens` at
+   admission?* Had it reserved, an aborted run and a full run would debit
+   identically no matter what the backend did — the experiment would have
+   reported "the provider kept generating" in every possible world,
+   including the one where cancellation works perfectly. Verified it debits
+   actual: `max_tokens=2000` requested, 23 tokens generated, 23 debited. The
+   `x-ratelimit-tokens-query-cost` header matched `usage.total_tokens`
+   exactly on every call.
+
+2. *Is the counter stable?* It is not — it is a **sliding 60-second
+   window**. Measured directly: 440 tokens spent, counter fell only 112,
+   roughly 328 aged back in during the measurement. This invalidated the
+   original probe's 2-second settle delay in the most dangerous possible
+   direction: if the backend keeps generating, those tokens debit *as they
+   generate*, over the following tens of seconds, so reading 2s after
+   aborting sees nothing and prints "cancellation worked" regardless of the
+   truth. The first method was biased toward the comfortable conclusion.
+
+**Method after correction:** both arms read the counter at an identical
+wall-clock offset from run start, so sliding refill affects them equally and
+cancels out of the comparison; every trial is gated on an *observed* drained
+window rather than an assumed-sufficient quiet period; ABORTED runs first in
+each pair so residual FULL generation cannot bleed into it.
+
+**Finding:**
+
+```
+FULL     644, 590, 585, 590     (predicted ~625)
+ABORTED  108, -95, -10, -37
+```
+
+Every FULL run lands at the predicted full cost. No ABORTED run does — all
+four sit in a noise band around zero. Had the backend continued to
+`max_tokens`, ABORTED would read ~600, a signal many times the noise floor
+and impossible to miss.
+
+A second, independent signal agrees. The time the window takes to drain
+before the *next* trial is a proxy for what the previous trial consumed:
+after an ABORTED trial the next drains in 0 polls; after a FULL trial it
+needs 5–9 polls (50–90s). Four for four, measured by an entirely different
+mechanism than the delta arithmetic.
+
+**What is still unknown:** whether the residual is zero or a tail of a few
+dozen tokens generated after the socket closes. That is below this
+instrument's noise floor and no number of re-runs fixes it — resolving it
+needs a per-request usage API, not a rate-limit header. Budget for a tail
+rather than assuming the cutoff is instant.
+
+**What this does *not* cover:** fencing still does not prevent a
+*reclaiming* worker from issuing a second billed call. Because a reclaimed
+workflow re-runs its handler from the start (decision 13), a
+stalled-then-reclaimed workflow can pay twice regardless of how cleanly the
+first worker aborted. That is a separate gap, closed by provider-side
+idempotency keys on egress, which are not yet implemented.
+
+**Generalizing the lesson, since it recurred three times:** every
+measurement built during this work initially returned a confident, plausible
+number that did not survive scrutiny — the transport fixture measured its
+own chunk cadence, the first probe measured its own settle delay, and the
+second measured the previous trial's refund. None failed loudly; all three
+would have been believed. Validate the instrument against a known quantity
+before trusting what it says about an unknown one.
+
 ## Known open items
 - **Poison-pilled outbox rows have no retention path:** Once `retry_count` 
   crosses `max_retries`, a `workflow_outbox` row sits permanently at 

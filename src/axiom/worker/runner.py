@@ -198,6 +198,19 @@ async def process_message(
         await redis.xack(stream_name, _GROUP_NAME, message_id)
 
 
+def _log_if_failed(task: asyncio.Task[None]) -> None:
+    """Surface an unexpected escape from process_message, which promises not to raise.
+
+    Without this the exception sits unretrieved on the task and asyncio
+    reports it only at garbage-collection time, detached from any context.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("process_message raised unexpectedly", exc_info=exc)
+
+
 async def run_forever(
     pool: asyncpg.Pool,
     redis: Redis,
@@ -215,30 +228,34 @@ async def run_forever(
     batch_size: int,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Consume stream_name until shutdown_event is set.
+    """Consume stream_name until shutdown_event is set, working on messages concurrently.
 
     Each cycle checks the reclaim path (XAUTOCLAIM — messages left idle
     by a crashed worker) before the fresh path (XREADGROUP). XREADGROUP's
     own BLOCK option provides the idle wait natively; no separate sleep
     is needed the way the Relay needed one for Postgres polling.
+
+    batch_size is the ceiling on messages in flight at once, and both
+    fetches ask only for as many as there are free slots. Fetching more
+    than can be worked on would move them into this consumer's PEL, where
+    they are held — unworked and invisible to every other worker — until
+    min_idle_time elapses. Concurrency is safe here because the claim
+    query, not the fetch pattern, is what prevents two workers executing
+    one row: a second claimant finds the row already RUNNING on a live
+    lease and correctly gets nothing.
+
+    On shutdown, in-flight work is drained rather than abandoned; each
+    task holds a claimed row and an un-acked message.
     """
     await ensure_consumer_group(redis, stream_name=stream_name)
     logger.info("worker starting, stream=%s, consumer=%s", stream_name, consumer_name)
 
-    while not shutdown_event.is_set():
-        _next_cursor, reclaimed, _deleted = cast(
-            _XAutoclaimResult,
-            await redis.xautoclaim(
-                stream_name,
-                _GROUP_NAME,
-                consumer_name,
-                min_idle_time=xautoclaim_min_idle_seconds * 1000,
-                start_id="0-0",
-                count=batch_size,
-            ),
-        )
-        for message_id, fields in reclaimed:
-            await process_message(
+    in_flight: set[asyncio.Task[None]] = set()
+
+    def _spawn(message_id: str, fields: dict[str, str]) -> None:
+        """Start one message processing concurrently with the others in flight."""
+        task = asyncio.create_task(
+            process_message(
                 pool,
                 redis,
                 stream_name=stream_name,
@@ -252,6 +269,40 @@ async def run_forever(
                 retry_base_seconds=retry_base_seconds,
                 retry_cap_seconds=retry_cap_seconds,
             )
+        )
+        in_flight.add(task)
+        # Holding a strong reference until completion: the loop keeps only a
+        # weak reference to a task, so an unreferenced one can be collected
+        # mid-flight.
+        task.add_done_callback(in_flight.discard)
+        task.add_done_callback(_log_if_failed)
+
+    while not shutdown_event.is_set():
+        free = batch_size - len(in_flight)
+        if free <= 0:
+            # Saturated. Wait for a slot rather than fetching messages that
+            # would sit unworked in our PEL, invisible to idle workers until
+            # min_idle_time elapses.
+            await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            continue
+
+        _next_cursor, reclaimed, _deleted = cast(
+            _XAutoclaimResult,
+            await redis.xautoclaim(
+                stream_name,
+                _GROUP_NAME,
+                consumer_name,
+                min_idle_time=xautoclaim_min_idle_seconds * 1000,
+                start_id="0-0",
+                count=free,
+            ),
+        )
+        for message_id, fields in reclaimed:
+            _spawn(message_id, fields)
+
+        free = batch_size - len(in_flight)
+        if free <= 0:
+            continue
 
         response = cast(
             _XReadGroupResult,
@@ -259,25 +310,19 @@ async def run_forever(
                 _GROUP_NAME,
                 consumer_name,
                 streams={stream_name: ">"},
-                count=batch_size,
+                count=free,
                 block=500,
             ),
         )
         for _stream, messages in response or []:
             for message_id, fields in messages:
-                await process_message(
-                    pool,
-                    redis,
-                    stream_name=stream_name,
-                    message_id=message_id,
-                    payload=fields.get("payload", ""),
-                    worker_id=worker_id,
-                    handlers=handlers,
-                    lease_seconds=lease_seconds,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                    max_retries=max_retries,
-                    retry_base_seconds=retry_base_seconds,
-                    retry_cap_seconds=retry_cap_seconds,
-                )
+                _spawn(message_id, fields)
+
+    # Graceful drain: in-flight work has already claimed its rows and holds
+    # un-acked messages, so abandoning it would strand both until the lease
+    # and min_idle_time expire.
+    if in_flight:
+        logger.info("draining %d in-flight message(s) before stopping", len(in_flight))
+        await asyncio.gather(*in_flight, return_exceptions=True)
 
     logger.info("worker stopped, stream=%s, consumer=%s", stream_name, consumer_name)
