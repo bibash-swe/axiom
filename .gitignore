@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Local-only engineering notes — deliberately not published
+docs/mastery.md
