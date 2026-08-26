@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     worker_max_retries: int = 5
     worker_batch_size: int = 10
 
+    # Full-jitter exponential backoff between retries of a failed handler.
+    # Jitter is not decoration: without it, N workflows failing on the same
+    # provider outage retry in lockstep and re-create the spike that caused
+    # the outage.
+    worker_retry_base_seconds: float = 1.0
+    worker_retry_cap_seconds: float = 60.0
+
 
     log_level: str = "INFO"
     env: str = "development"

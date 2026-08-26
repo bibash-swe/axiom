@@ -26,11 +26,13 @@ from redis.exceptions import ResponseError
 from axiom.contracts.enums import WorkflowStatus
 from axiom.contracts.events import WorkflowStartedEvent
 from axiom.worker.execution import (
+    NonRetryableError,
     WorkerFencedError,
     check_and_handle_poison_pill,
     execute_with_heartbeat,
+    retry_delay_seconds,
 )
-from axiom.worker.worker import claim_workflow, settle_terminal
+from axiom.worker.worker import claim_workflow, schedule_retry, settle_terminal
 
 logger = logging.getLogger("axiom.worker")
 
@@ -71,6 +73,8 @@ async def process_message(
     lease_seconds: int,
     heartbeat_interval_seconds: int,
     max_retries: int,
+    retry_base_seconds: float,
+    retry_cap_seconds: float,
 ) -> None:
     """Process one stream message end to end. Never raises.
 
@@ -139,15 +143,47 @@ async def process_message(
     except WorkerFencedError:
         logger.warning("fenced during execution, workflow_id=%s", workflow_id)
         return
-    except Exception as exc:
+    except NonRetryableError as exc:
         settled = await settle_terminal(
             pool,
             workflow_id=workflow_id,
             lease_generation=claimed.lease_generation,
             status=WorkflowStatus.FAILED,
-            error_log={"error": str(exc), "error_type": type(exc).__name__},
+            error_log={"error": str(exc), "error_type": type(exc).__name__, "retryable": False},
         )
         if settled:
+            await redis.xack(stream_name, _GROUP_NAME, message_id)
+        return
+    except Exception as exc:
+        # Everything a handler raises that isn't explicitly permanent gets
+        # another attempt. The ceiling is not enforced here — the next
+        # claim's poison-pill check owns giving up, so there is exactly one
+        # place that decides a workflow is dead.
+        delay = retry_delay_seconds(
+            claimed.lease_generation,
+            base_seconds=retry_base_seconds,
+            cap_seconds=retry_cap_seconds,
+        )
+        scheduled = await schedule_retry(
+            pool,
+            workflow_id=workflow_id,
+            lease_generation=claimed.lease_generation,
+            delay_seconds=delay,
+            error_log={
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "attempt": claimed.lease_generation,
+                "retry_in_seconds": round(delay, 3),
+            },
+        )
+        if scheduled:
+            logger.warning(
+                "handler failed on attempt %d, retrying workflow_id=%s in %.2fs: %s",
+                claimed.lease_generation,
+                workflow_id,
+                delay,
+                exc,
+            )
             await redis.xack(stream_name, _GROUP_NAME, message_id)
         return
 
@@ -174,6 +210,8 @@ async def run_forever(
     heartbeat_interval_seconds: int,
     xautoclaim_min_idle_seconds: int,
     max_retries: int,
+    retry_base_seconds: float,
+    retry_cap_seconds: float,
     batch_size: int,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -211,6 +249,8 @@ async def run_forever(
                 lease_seconds=lease_seconds,
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 max_retries=max_retries,
+                retry_base_seconds=retry_base_seconds,
+                retry_cap_seconds=retry_cap_seconds,
             )
 
         response = cast(
@@ -236,6 +276,8 @@ async def run_forever(
                     lease_seconds=lease_seconds,
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                     max_retries=max_retries,
+                    retry_base_seconds=retry_base_seconds,
+                    retry_cap_seconds=retry_cap_seconds,
                 )
 
     logger.info("worker stopped, stream=%s, consumer=%s", stream_name, consumer_name)

@@ -15,6 +15,7 @@ from uuid import UUID
 import asyncpg
 
 from axiom.contracts.enums import WorkflowStatus
+from axiom.contracts.events import WorkflowStartedEvent
 
 # No SKIP LOCKED here, unlike the Relay's batch claim — this targets one
 # specific row by primary key, not a scan across many candidates. A
@@ -41,6 +42,30 @@ _SETTLE_TERMINAL = """
     UPDATE workflow_states
     SET status = $3, output_data = $4::jsonb, error_log = $5::jsonb, updated_at = NOW()
     WHERE id = $1 AND lease_generation = $2
+"""
+
+# Release back to PENDING and redispatch, in one statement so a workflow can
+# never end up released-but-not-redispatched (stranded until nothing) or
+# redispatched-but-still-RUNNING (claimable by nobody until the lease lapses).
+# The CTE carries the fence: if lease_generation no longer matches, it
+# returns no rows and the INSERT inserts nothing, so a superseded worker
+# cannot resurrect a workflow that another worker now owns.
+_SCHEDULE_RETRY = """
+    WITH fenced AS (
+        UPDATE workflow_states
+        SET status = 'PENDING',
+            error_log = $3::jsonb,
+            worker_id = NULL,
+            lease_expires_at = NULL,
+            updated_at = NOW()
+        WHERE id = $1 AND lease_generation = $2
+        RETURNING id, workflow_version
+    )
+    INSERT INTO workflow_outbox
+        (workflow_id, event_type, payload, workflow_version, available_at)
+    SELECT id, 'WORKFLOW_STARTED', $4::jsonb, workflow_version,
+           NOW() + make_interval(secs => $5)
+    FROM fenced
 """
 
 
@@ -119,3 +144,34 @@ async def settle_terminal(
             json.dumps(error_log) if error_log is not None else None,
         )
     return result == "UPDATE 1"
+
+
+async def schedule_retry(
+    pool: asyncpg.Pool,
+    *,
+    workflow_id: UUID,
+    lease_generation: int,
+    delay_seconds: float,
+    error_log: dict[str, Any],
+) -> bool:
+    """Release a failed workflow back to PENDING and redispatch it after delay_seconds.
+
+    Fenced like every other write here: returns False if this worker was
+    superseded, in which case the caller must NOT ack — the current lease
+    holder owns what happens next.
+
+    No attempt counter is incremented here. lease_generation already counts
+    attempts because every redispatch ends in a fresh claim, and the ceiling
+    is enforced once, in check_and_handle_poison_pill().
+    """
+    event = WorkflowStartedEvent(workflow_id=workflow_id)
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            _SCHEDULE_RETRY,
+            workflow_id,
+            lease_generation,
+            json.dumps(error_log),
+            event.model_dump_json(),
+            delay_seconds,
+        )
+    return result == "INSERT 0 1"
