@@ -39,6 +39,19 @@ affects zero rows on its own. `SELECT ... FOR UPDATE SKIP LOCKED` is used by the
 Relay's *batch* claim, where many candidate rows are scanned. Both are checked by
 concurrent tests against a real Postgres instance.
 
+**✅ Multi-step composition — built and verified.**
+A handler continues the chain by returning `NextStep(...)` instead of its
+output. The worker completes the current workflow and creates the next one —
+row plus outbox event — in a single transaction, so a crash can never leave a
+chain that reads as successfully finished while the rest of the work silently
+never ran. Each step is a full workflow with its own lease, retries and
+dead-letter budget, which is what makes a retry replay one step rather than
+the whole chain: on an LLM workload, replaying step 1 to recover step 2 means
+paying for it twice. Runaway chains are bounded by a configured depth ceiling,
+and a workflow that hits it fails loudly rather than dropping its successor.
+Verified end to end through a real Relay and Worker, and the tests themselves
+were checked by mutation — see `docs/decisions.md` #16.
+
 **⚠️ Cost-safety — mechanism proven, provider behavior not.**
 A superseded worker detects supersession between stream chunks and closes the
 transport. That much is proven: measured against a real socket and observed from

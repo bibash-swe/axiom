@@ -29,7 +29,7 @@ _CLAIM = """
         lease_expires_at = NOW() + make_interval(secs => $3)
     WHERE id = $1
       AND (status = 'PENDING' OR (status = 'RUNNING' AND lease_expires_at < NOW()))
-    RETURNING id, lease_generation, workflow_type, workflow_version, input_data
+    RETURNING id, lease_generation, workflow_type, workflow_version, input_data, chain_depth
 """
 
 _RENEW_LEASE = """
@@ -68,6 +68,54 @@ _SCHEDULE_RETRY = """
     FROM fenced
 """
 
+# Chaining is three statements rather than one CTE, unlike _SCHEDULE_RETRY
+# above, for one concrete reason: the outbox payload has to carry the
+# successor's id, and that id doesn't exist until the successor row is
+# inserted. Building the payload in SQL with jsonb_build_object would work but
+# would put a second, hand-typed copy of the WorkflowStartedEvent shape outside
+# contracts/ — exactly the drift that package exists to prevent. Atomicity
+# comes from the enclosing transaction, which is just as strong.
+_COMPLETE_PARENT = """
+    UPDATE workflow_states
+    SET status = 'COMPLETED', output_data = $3::jsonb, updated_at = NOW()
+    WHERE id = $1 AND lease_generation = $2
+    RETURNING workflow_version, chain_depth
+"""
+
+# Same ON CONFLICT ... RETURNING (xmax = 0) shape as the ingress insert, and
+# for the same reason (docs/decisions.md #8): a replay must be absorbed rather
+# than forked, and the caller must be able to tell which happened so it does
+# not write a second outbox event for a successor that already has one.
+_INSERT_SUCCESSOR = """
+    INSERT INTO workflow_states
+        (workflow_type, workflow_version, status, idempotency_key,
+         input_data, parent_workflow_id, chain_depth)
+    VALUES ($1, $2, 'PENDING', $3, $4::jsonb, $5, $6)
+    ON CONFLICT (idempotency_key)
+    DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+    RETURNING id, (xmax = 0) AS is_new_row
+"""
+
+_INSERT_SUCCESSOR_EVENT = """
+    INSERT INTO workflow_outbox (workflow_id, event_type, payload, workflow_version)
+    VALUES ($1, 'WORKFLOW_STARTED', $2::jsonb, $3)
+"""
+
+
+def chain_idempotency_key(parent_workflow_id: UUID, next_workflow_type: str) -> str:
+    """The successor's idempotency key, derived so it is the same on every replay.
+
+    A random key would let one parent produce two successors if its chain
+    write ever ran twice. Deriving it from the parent makes the second write
+    collide with the first and become a no-op instead.
+
+    The 'chain:' prefix is reserved at the database — see migration 003 — so a
+    client-submitted key can never land on a chain step. Worst case is 143
+    characters against a VARCHAR(255) column: 6 for the prefix, 36 for the
+    UUID, 1 separator, and workflow_type's own VARCHAR(100) ceiling.
+    """
+    return f"chain:{parent_workflow_id}:{next_workflow_type}"
+
 
 @dataclass(frozen=True)
 class ClaimedWorkflow:
@@ -78,6 +126,7 @@ class ClaimedWorkflow:
     workflow_type: str
     workflow_version: str
     input_data: dict[str, Any]
+    chain_depth: int
 
 
 async def claim_workflow(
@@ -102,6 +151,7 @@ async def claim_workflow(
         workflow_type=row["workflow_type"],
         workflow_version=row["workflow_version"],
         input_data=json.loads(raw_input) if raw_input else {},
+        chain_depth=row["chain_depth"],
     )
 
 
@@ -175,3 +225,67 @@ async def schedule_retry(
             delay_seconds,
         )
     return result == "INSERT 0 1"
+
+
+async def settle_and_chain(
+    pool: asyncpg.Pool,
+    *,
+    workflow_id: UUID,
+    lease_generation: int,
+    output_data: dict[str, Any],
+    next_workflow_type: str,
+    next_input_data: dict[str, Any],
+) -> UUID | None:
+    """Complete a workflow and create its successor in one transaction.
+
+    Returns the successor's id, or None if this worker was fenced out — in
+    which case nothing at all was written and the caller must NOT ack, same
+    rule as every other write in this module.
+
+    The single transaction is the whole point. Completing the parent and
+    dispatching the successor as two separate writes would leave a window
+    where a crash ends the chain silently: the parent reads COMPLETED, the
+    caller sees a successful workflow, and the remaining steps simply never
+    happen. There is no reconciliation pass that could detect that, because a
+    COMPLETED row with no successor is exactly what the last step of a chain
+    looks like.
+
+    The successor inherits workflow_version rather than taking the current
+    default, so a chain runs to completion on the version it started on and
+    cordon-and-drain stays meaningful mid-chain.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        parent = await conn.fetchrow(
+            _COMPLETE_PARENT, workflow_id, lease_generation, json.dumps(output_data)
+        )
+        if parent is None:
+            return None
+
+        successor = await conn.fetchrow(
+            _INSERT_SUCCESSOR,
+            next_workflow_type,
+            parent["workflow_version"],
+            chain_idempotency_key(workflow_id, next_workflow_type),
+            json.dumps(next_input_data),
+            workflow_id,
+            parent["chain_depth"] + 1,
+        )
+        if successor is None:
+            raise RuntimeError("settle_and_chain: successor insert returned no row")
+
+        successor_id: UUID = successor["id"]
+
+        # Only on a genuine insert. A conflict means this exact successor was
+        # already created — necessarily inside a transaction that also wrote
+        # its outbox event — so writing a second event here would dispatch the
+        # same workflow twice.
+        if successor["is_new_row"]:
+            event = WorkflowStartedEvent(workflow_id=successor_id)
+            await conn.execute(
+                _INSERT_SUCCESSOR_EVENT,
+                successor_id,
+                event.model_dump_json(),
+                parent["workflow_version"],
+            )
+
+        return successor_id

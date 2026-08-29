@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     worker_retry_base_seconds: float = 1.0
     worker_retry_cap_seconds: float = 60.0
 
+    # The highest chain_depth a workflow may reach; the root of a chain is 0,
+    # so a chain may hold max_chain_depth + 1 workflows. A handler bug that
+    # always chains would otherwise loop forever — and unlike a retry loop, a
+    # chain loop is not bounded by max_retries, because every link is a fresh
+    # workflow with a fresh budget.
+    worker_max_chain_depth: int = 50
+
 
     log_level: str = "INFO"
     env: str = "development"

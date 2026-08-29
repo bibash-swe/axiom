@@ -97,6 +97,7 @@ async def _run_until_done(
             max_retries=5,
             retry_base_seconds=0.01,
             retry_cap_seconds=0.01,
+            max_chain_depth=50,
             batch_size=10,
             shutdown_event=shutdown,
         )
