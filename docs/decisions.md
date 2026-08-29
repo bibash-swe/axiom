@@ -510,6 +510,89 @@ no handler ships with the engine — and declaring a setting before its consumer
 exists is the drift ruled out in #5. It is a parameter default until a caller
 needs to tune it.
 
+## 18. Provider-side idempotency keys do not exist on Mistral — the named fix is unavailable
+
+**Finding:** Mistral does not honour an idempotency key on
+`/v1/chat/completions`. Measured August 2026, `mistral-small-latest`, standard
+tier, via `scripts/mistral_idempotency_probe.py`. Both `Idempotency-Key` and
+`X-Idempotency-Key` behaved *identically to a deliberately meaningless header*:
+the second of two identical requests came back with a new response `id`, new
+content, and a full token charge.
+
+```
+Control A  no key, twice          distinct ids          (the oracle discriminates)
+Control B  cost header vs usage   agreed on 8/8 calls   (the cost signal is real)
+Control D  nonsense header, twice regenerated, billed   (unknown headers ignored)
+Idempotency-Key,   same twice     regenerated, billed
+X-Idempotency-Key, same twice     regenerated, billed
+```
+
+**Why the obvious oracle was rejected.** "The same text came back, so it was a
+cached replay" is wrong twice over here: Mistral exposes a `random_seed`
+parameter, and a low temperature can make two genuine generations identical
+anyway. Either would report a cache hit in a world with no cache. The oracle
+is instead the response `id`, plus `x-ratelimit-tokens-query-cost` — which #15
+established equals `usage.total_tokens` exactly, and which was re-checked on
+every call here rather than assumed still true three days later.
+
+**Why Control D is the one that makes this conclusive.** A null result is only
+worth anything if a positive result was reachable. Control A proves the
+instrument can see a replay; Control D establishes what "this header did
+nothing" looks like. The experiment matched D exactly, which is the difference
+between "not supported" and "we sent it wrong."
+
+**What this invalidates.** The README's cost-safety section, and #15, both
+named provider-side idempotency keys as the fix for reclaim double-billing.
+That remedy does not exist on this provider, and checking the other major ones
+suggests it is not an industry standard either:
+
+| Provider | Idempotency on chat completions | Evidence |
+|---|---|---|
+| Mistral | No | **Measured**, August 2026, by this probe |
+| Anthropic | Not documented | Official API overview enumerates every request header — `x-api-key`, `Authorization`, `anthropic-workspace-id`, `anthropic-version`, `content-type` — and none is an idempotency key |
+| OpenAI | Not documented for chat completions | Official Node SDK README documents automatic retries but no idempotency mechanism; `Idempotency-Key` appears only on the Agentic Commerce API |
+| xAI (Grok) | Not documented | Chat completions reference documents only `Content-Type` and `Authorization` |
+
+Only the Mistral row is a measurement. The rest is documentation, and this
+probe's whole point is that absence from documentation is not absence of
+behaviour — Mistral's own docs were silent too, and it took an experiment to
+turn that silence into a fact. The script now takes `PROBE_BASE_URL`,
+`PROBE_MODEL` and `PROBE_API_KEY` so any OpenAI-compatible provider can be
+measured the moment a key exists. Until then those three rows are marked "not
+documented", never "does not support".
+
+**The detail that makes this worse than a null result.** OpenAI's official SDK
+retries connection errors, 408, 409, 429 and 5xx twice by default, with no
+deduplication mechanism documented anywhere. So the industry-standard client
+silently re-issues paid requests on exactly the failure class this engine
+exists to survive. The double-billing exposure is not a corner case we
+invented; it ships on by default in the most widely used client, and no
+provider we checked offers the primitive that would make it safe.
+
+**What replaces it, and what it can honestly promise.** The gap has to close
+without provider cooperation: persist the completion in Postgres keyed by
+`(workflow_id, call_index)` the moment it arrives, and have a re-running
+handler reuse the record instead of re-calling. Three properties of that design
+need deciding deliberately when it is built, and are recorded here so they are
+not discovered late:
+
+- The write must be **unfenced**, unlike every other write in this system. A
+  superseded worker still has to record it, because the memo is not workflow
+  state — it is a receipt for money already spent, and that stays true no
+  matter who owns the row afterwards.
+- It **narrows the window rather than eliminating it**. A worker that dies
+  between receiving the response and committing the memo still pays twice. The
+  exposure shrinks from the whole handler duration to a single Postgres write,
+  which is a large improvement and not a guarantee. It should be described that
+  way.
+- It does **not** cover two workers genuinely in flight at once, only the
+  sequential re-run that reclaim produces.
+
+It also imports a determinism assumption — `call_index` is only stable if a
+handler issues its calls in the same order every run — which is a real
+constraint on handler authors and belongs in the public contract, not in a
+comment.
+
 ---
 
 ## Known open items
@@ -523,6 +606,17 @@ needs to tune it.
   `relay.py` — `dispatched` must keep meaning "this actually reached 
   Redis," never "we gave up." Low urgency (poison-pills should be rare 
   in a healthy system) but a real gap, not yet built.
+- **The Relay tests silently assume a nearly-empty outbox.** `claim_batch` is
+  `ORDER BY created_at ASC LIMIT batch_size`, so a test that creates a row and
+  then claims a batch only finds it while fewer than `batch_size` older
+  undispatched rows exist. Hit for real while working on #18: scratch scripts
+  had left 104 undispatched rows, putting the new row at position 105, and
+  `test_settle_failures_dead_letters_at_max_retries` failed with an assertion
+  that looks like a Relay bug and is not. The tests are correct about the
+  Relay and wrong about their own isolation. Fix is for those tests to scope
+  their claim to their own `workflow_version` rather than trusting global
+  table state. Related to the outbox retention gap above — both are the same
+  underlying fact, that nothing ever removes an undispatched row.
 - **Heartbeat timing has never been tested under realistic concurrent
   process pressure.** The 10s heartbeat / 30s lease ratio gives a 3x
   margin against a single missed tick, but that ratio was chosen for
