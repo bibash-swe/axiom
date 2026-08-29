@@ -482,6 +482,12 @@ one fencing check  p50 0.767ms   p95 1.08ms   p99 1.56ms
 20 streams         21.1% inflation, 753 fencing queries/sec from one worker
 ```
 
+Those check latencies are against a local Docker Postgres over loopback, which
+is the best case this query will ever see. A deployment with a network hop to
+the database pays more per check, so the loopback numbers are a floor and the
+argument below only gets stronger — but the figures should not be quoted as if
+they were production numbers.
+
 **Why that is a design flaw and not just a cost.** 3.5% of a second per stream
 is affordable today. The shape is the problem: the load is proportional to the
 provider's *token rate*, so a faster model silently buys more database load,

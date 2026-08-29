@@ -216,8 +216,11 @@ async def stream_guard[ItemT](
     lands. Pass 0.0 to check after every item.
     """
     loop = asyncio.get_running_loop()
-    # Start the clock at entry: the claim that established this generation
-    # just happened, so a check on the very first chunk cannot learn anything.
+    # The clock starts when iteration does, so the first chunk is checked only
+    # if it took longer than the interval to arrive. That is not a special case
+    # for entry — it is the same rule as every other chunk — and on a real
+    # stream it resolves to "yes": measured time-to-first-token is ~0.5s
+    # against a 0.1s interval.
     last_checked_at = loop.time()
 
     async for item in source:
