@@ -64,8 +64,15 @@ Two things are explicitly **not** established, and are not claimed:
 - Fencing does **not** stop a *reclaiming* worker from issuing a second paid
   call. Because a reclaimed workflow re-runs its handler from the start (see
   `docs/decisions.md` #13), a stalled-then-reclaimed workflow can bill twice.
-  Closing that gap requires provider-side idempotency keys on egress, which are
-  not yet implemented.
+  This page previously said the fix was provider-side idempotency keys. That
+  was measured in August 2026 and is wrong: Mistral ignores `Idempotency-Key`
+  entirely — a replayed request regenerates, with a new response id and a full
+  token charge, behaving exactly like a header the API does not recognise.
+  Anthropic, OpenAI and xAI document no equivalent for chat completions either.
+  Worse, OpenAI's own SDK retries 409/429/5xx twice by default with nothing
+  deduplicating them. Closing this gap therefore cannot depend on provider
+  cooperation, and needs a mechanism we own — see `docs/decisions.md` #18 for
+  the measurement and the design it points to. Not yet implemented.
 
 **⬜ Anti-entropy — designed, not built (Phase 4).**
 The reconciliation sweep is specified, and deliberately scoped so the Janitor
