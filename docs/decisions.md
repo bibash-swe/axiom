@@ -462,6 +462,54 @@ status — and each one was caught by a named test. A green suite that stays
 green while the guarantee is broken is the failure mode this project has
 already hit three times (#15); it is cheaper to check than to trust.
 
+## 17. `stream_guard` paces its fencing checks by time, not by chunk
+
+**Decision:** `stream_guard()` checks the lease at most once per
+`min_check_interval_seconds` (default 0.1) rather than after every yielded
+item. Passing `0.0` restores per-chunk checking.
+
+**Why this was an open item, and what closed it.** The previous entry in this
+list flagged that the per-chunk Postgres round-trip had only ever been tested
+against a synthetic 5-item generator, with no measurement behind the
+assumption that it was affordable. It has now been measured, against a real
+`mistral-small-latest` stream and a warm pool:
+
+```
+provider rate      500 completion tokens in 2.85s
+                   = ~175 tokens/sec, delivered as ~46 chunks/sec
+one fencing check  p50 0.767ms   p95 1.08ms   p99 1.56ms
+1 stream           6.9% wall-clock inflation
+20 streams         21.1% inflation, 753 fencing queries/sec from one worker
+```
+
+Those check latencies are against a local Docker Postgres over loopback, which
+is the best case this query will ever see. A deployment with a network hop to
+the database pays more per check, so the loopback numbers are a floor and the
+argument below only gets stronger — but the figures should not be quoted as if
+they were production numbers.
+
+**Why that is a design flaw and not just a cost.** 3.5% of a second per stream
+is affordable today. The shape is the problem: the load is proportional to the
+provider's *token rate*, so a faster model silently buys more database load,
+and nothing bounds it. A durable execution engine whose overhead scales with
+someone else's product decisions has the dependency backwards.
+
+**What the interval costs, stated rather than hidden.** A superseded worker
+can keep consuming for up to one interval before the abort lands — at ~175
+tokens/sec, roughly 18 further tokens. That is the honest trade: bounded,
+tiny, and paid only on the rare fencing event, against unbounded steady-state
+load paid on every chunk of every stream. The already-consumed chunks are
+never persisted anyway, because the settle that follows is fenced.
+
+**Why the default is 0.1 and not 0.25:** both bound the load acceptably (0.77%
+versus 0.3% of a second per stream). 0.1 keeps abort latency crisp for a
+fifth of a percent more, and cost-safety is the reason this mechanism exists.
+
+**Why there is no config setting for it.** Nothing in `src/` consumes it yet —
+no handler ships with the engine — and declaring a setting before its consumer
+exists is the drift ruled out in #5. It is a parameter default until a caller
+needs to tune it.
+
 ---
 
 ## Known open items
@@ -475,14 +523,6 @@ already hit three times (#15); it is cheaper to check than to trust.
   `relay.py` — `dispatched` must keep meaning "this actually reached 
   Redis," never "we gave up." Low urgency (poison-pills should be rare 
   in a healthy system) but a real gap, not yet built.
-- **`stream_guard()`'s per-chunk check has never been load-tested at
-  realistic LLM token rates.** The abort mechanism is proven correct
-  (a concurrent test confirms it fires precisely between chunks), but
-  its overhead — a Postgres round-trip per yielded item — has only been
-  tested against a synthetic 5-item generator, not against something
-  simulating 50-100 tokens/sec. At that rate, multiplied across
-  concurrently-streaming workers, this could become real read load with
-  no measurement backing the assumption that it's fine.
 - **Heartbeat timing has never been tested under realistic concurrent
   process pressure.** The 10s heartbeat / 30s lease ratio gives a 3x
   margin against a single missed tick, but that ratio was chosen for

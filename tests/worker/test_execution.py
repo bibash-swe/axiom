@@ -143,6 +143,70 @@ async def test_stream_guard_yields_items_when_not_fenced(
     assert items == [0, 1, 2]
 
 
+async def test_stream_guard_paces_its_fencing_checks(
+    pool: asyncpg.Pool, make_workflow_row: MakeWorkflowRow
+) -> None:
+    """Checks are rate-limited, so their cost does not scale with the token rate.
+
+    A per-chunk check means a faster model silently buys more database load:
+    measured against a real Mistral stream, 46 chunks/sec per stream and 753
+    fencing queries/sec at 20 concurrent streams. The interval decouples the
+    two, at the cost of up to one interval of further generation after being
+    superseded.
+    """
+    wid = await make_workflow_row(idempotency_key=f"k_{uuid4()}")
+    claimed = await claim_workflow(pool, workflow_id=wid, worker_id=uuid4(), lease_seconds=30)
+    assert claimed is not None
+
+    # Superseded before a single item is consumed: every check from here on
+    # would fail, so whether one fires is entirely down to the pacing.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE workflow_states SET lease_generation = lease_generation + 1 WHERE id = $1",
+            wid,
+        )
+
+    async def burst() -> Any:
+        for i in range(50):
+            yield i
+
+    # An interval longer than the stream: no check ever comes due, so the
+    # already-fenced worker consumes the whole thing. This is the tradeoff
+    # stated plainly rather than hidden.
+    delivered = [
+        item
+        async for item in stream_guard(
+            pool,
+            burst(),
+            workflow_id=wid,
+            lease_generation=claimed.lease_generation,
+            min_check_interval_seconds=60.0,
+        )
+    ]
+    assert delivered == list(range(50))
+
+    # But the interval must actually elapse into a check, not suppress it
+    # forever: a paced stream aborts within a small multiple of the interval.
+    async def paced() -> Any:
+        for i in range(200):
+            await asyncio.sleep(0.005)
+            yield i
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(WorkerFencedError):
+        async for _item in stream_guard(
+            pool,
+            paced(),
+            workflow_id=wid,
+            lease_generation=claimed.lease_generation,
+            min_check_interval_seconds=0.05,
+        ):
+            pass
+    abort_lag = loop.time() - started
+    assert abort_lag < 0.5, f"abort took {abort_lag:.3f}s against a 0.05s check interval"
+
+
 async def test_stream_guard_aborts_mid_stream_when_fenced(
     pool: asyncpg.Pool, make_workflow_row: MakeWorkflowRow
 ) -> None:
@@ -161,8 +225,16 @@ async def test_stream_guard_aborts_mid_stream_when_fenced(
 
     received = []
     with pytest.raises(WorkerFencedError):
+        # min_check_interval_seconds=0.0: this source yields instantly, so the
+        # default interval would consume all five items before a single check
+        # was due. This test is about abort semantics, not check pacing —
+        # that is covered separately.
         async for item in stream_guard(
-            pool, source(), workflow_id=wid, lease_generation=claimed.lease_generation
+            pool,
+            source(),
+            workflow_id=wid,
+            lease_generation=claimed.lease_generation,
+            min_check_interval_seconds=0.0,
         ):
             received.append(item)
             if len(received) == 1:

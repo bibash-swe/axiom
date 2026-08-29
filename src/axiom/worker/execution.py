@@ -191,18 +191,46 @@ async def stream_guard[ItemT](
     *,
     workflow_id: UUID,
     lease_generation: int,
+    min_check_interval_seconds: float = 0.1,
 ) -> AsyncIterator[ItemT]:
-    """Wrap a streaming execution with a per-chunk fencing check for cost-safety.
+    """Wrap a streaming execution with a fencing check for cost-safety.
 
-    After every yielded item, checks whether this worker still holds the
-    current lease_generation. On the first failed check, attempts to
-    close the underlying source (stopping further generation — and
-    billing) before raising WorkerFencedError. The already-yielded item
-    is not withheld: it was already generated, and cost-safety is about
-    not producing the *next* one, not clawing back the last.
+    Between yielded items, checks whether this worker still holds the current
+    lease_generation. On the first failed check, attempts to close the
+    underlying source (stopping further generation — and billing) before
+    raising WorkerFencedError. The already-yielded item is not withheld: it
+    was already generated, and cost-safety is about not producing the *next*
+    one, not clawing back the last.
+
+    Checks are rate-limited to one per min_check_interval_seconds rather than
+    one per chunk. Checking every chunk sounds safer and is in fact the wrong
+    shape: its cost scales with the provider's token rate, so a faster model
+    silently buys more database load. Measured against a real Mistral stream
+    (~46 chunks/sec) and a warm pool, a per-chunk check costs p50 0.77ms and
+    inflates a single stream's wall time by 6.9%, rising to 21% at 20
+    concurrent streams — 753 fencing queries per second from one worker.
+
+    The interval bounds that at a fixed rate per stream whatever the model
+    does. What it costs is bounded too, and small: at ~175 tokens/sec, a 100ms
+    interval means at most ~18 further tokens are generated before the abort
+    lands. Pass 0.0 to check after every item.
     """
+    loop = asyncio.get_running_loop()
+    # The clock starts when iteration does, so the first chunk is checked only
+    # if it took longer than the interval to arrive. That is not a special case
+    # for entry — it is the same rule as every other chunk — and on a real
+    # stream it resolves to "yes": measured time-to-first-token is ~0.5s
+    # against a 0.1s interval.
+    last_checked_at = loop.time()
+
     async for item in source:
         yield item
+
+        now = loop.time()
+        if now - last_checked_at < min_check_interval_seconds:
+            continue
+        last_checked_at = now
+
         if not await _lease_generation_matches(
             pool, workflow_id=workflow_id, lease_generation=lease_generation
         ):
