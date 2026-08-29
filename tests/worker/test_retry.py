@@ -81,6 +81,7 @@ async def _run_until_terminal(
             max_retries=max_retries,
             retry_base_seconds=FAST_BASE,
             retry_cap_seconds=FAST_CAP,
+            max_chain_depth=50,
             batch_size=10,
             shutdown_event=worker_stop,
         )

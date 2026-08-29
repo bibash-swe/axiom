@@ -48,6 +48,7 @@ async def _main(stream_version: str) -> None:
             max_retries=settings.worker_max_retries,
             retry_base_seconds=settings.worker_retry_base_seconds,
             retry_cap_seconds=settings.worker_retry_cap_seconds,
+            max_chain_depth=settings.worker_max_chain_depth,
             batch_size=settings.worker_batch_size,
             shutdown_event=shutdown_event,
         )

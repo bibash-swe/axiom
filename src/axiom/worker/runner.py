@@ -11,6 +11,11 @@ does. A handler receives (pool, workflow_id, lease_generation, input_data)
 — the fencing context is passed through explicitly so a handler that
 needs to stream can wrap its own iterator in stream_guard() itself,
 without this module needing to know or care whether it does.
+
+A handler that returns a NextStep instead of a plain dict continues the
+chain: this module completes the current workflow and creates the next one
+in a single transaction, which is what makes a multi-step workflow durable
+rather than merely sequential.
 """
 
 import asyncio
@@ -26,18 +31,30 @@ from redis.exceptions import ResponseError
 from axiom.contracts.enums import WorkflowStatus
 from axiom.contracts.events import WorkflowStartedEvent
 from axiom.worker.execution import (
+    NextStep,
     NonRetryableError,
     WorkerFencedError,
     check_and_handle_poison_pill,
     execute_with_heartbeat,
     retry_delay_seconds,
 )
-from axiom.worker.worker import claim_workflow, schedule_retry, settle_terminal
+from axiom.worker.worker import (
+    ClaimedWorkflow,
+    claim_workflow,
+    schedule_retry,
+    settle_and_chain,
+    settle_terminal,
+)
 
 logger = logging.getLogger("axiom.worker")
 
+# A handler ends its workflow by returning its output, or continues the chain
+# by returning a NextStep. Nothing else distinguishes the two cases — no magic
+# key in the output dict, no separate "enqueue" call a handler could make and
+# then crash before committing.
+HandlerResult = dict[str, Any] | NextStep
 WorkflowHandler = Callable[
-    [asyncpg.Pool, UUID, int, dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]
+    [asyncpg.Pool, UUID, int, dict[str, Any]], Coroutine[Any, Any, HandlerResult]
 ]
 HandlerRegistry = dict[str, WorkflowHandler]
 
@@ -75,6 +92,7 @@ async def process_message(
     max_retries: int,
     retry_base_seconds: float,
     retry_cap_seconds: float,
+    max_chain_depth: int,
 ) -> None:
     """Process one stream message end to end. Never raises.
 
@@ -187,6 +205,18 @@ async def process_message(
             await redis.xack(stream_name, _GROUP_NAME, message_id)
         return
 
+    if isinstance(output, NextStep):
+        await _settle_chained(
+            pool,
+            redis,
+            stream_name=stream_name,
+            message_id=message_id,
+            claimed=claimed,
+            next_step=output,
+            max_chain_depth=max_chain_depth,
+        )
+        return
+
     settled = await settle_terminal(
         pool,
         workflow_id=workflow_id,
@@ -196,6 +226,78 @@ async def process_message(
     )
     if settled:
         await redis.xack(stream_name, _GROUP_NAME, message_id)
+
+
+async def _settle_chained(
+    pool: asyncpg.Pool,
+    redis: Redis,
+    *,
+    stream_name: str,
+    message_id: str,
+    claimed: ClaimedWorkflow,
+    next_step: NextStep,
+    max_chain_depth: int,
+) -> None:
+    """Complete a step that asked to continue, enforcing the chain-depth ceiling.
+
+    The ceiling is the only thing standing between a handler bug and an
+    unbounded chain — and unlike a runaway retry loop, a runaway chain is not
+    self-limiting: every link is a fresh workflow with a fresh retry budget, so
+    max_retries never stops it. On an LLM workload that is real money spent in
+    a loop nobody asked for.
+    """
+    if claimed.chain_depth + 1 > max_chain_depth:
+        # Fail rather than quietly dropping the successor. Truncating the chain
+        # silently would leave a COMPLETED row indistinguishable from a chain
+        # that genuinely ended — the operator would never learn the rest of the
+        # work never ran. The handler's own output is still recorded, so
+        # nothing it computed is lost.
+        logger.error(
+            "chain depth limit reached at workflow_id=%s (depth %d, max %d); "
+            "refusing to create a %r successor",
+            claimed.id,
+            claimed.chain_depth,
+            max_chain_depth,
+            next_step.workflow_type,
+        )
+        settled = await settle_terminal(
+            pool,
+            workflow_id=claimed.id,
+            lease_generation=claimed.lease_generation,
+            status=WorkflowStatus.FAILED,
+            output_data=next_step.output,
+            error_log={
+                "error": "chain depth limit reached",
+                "chain_depth": claimed.chain_depth,
+                "max_chain_depth": max_chain_depth,
+                "refused_workflow_type": next_step.workflow_type,
+                "retryable": False,
+            },
+        )
+        if settled:
+            await redis.xack(stream_name, _GROUP_NAME, message_id)
+        return
+
+    successor_id = await settle_and_chain(
+        pool,
+        workflow_id=claimed.id,
+        lease_generation=claimed.lease_generation,
+        output_data=next_step.output,
+        next_workflow_type=next_step.workflow_type,
+        next_input_data=next_step.input_data,
+    )
+    if successor_id is None:
+        logger.warning("fenced during chain write, workflow_id=%s", claimed.id)
+        return
+
+    logger.info(
+        "workflow_id=%s completed and chained to %s (%s) at depth %d",
+        claimed.id,
+        successor_id,
+        next_step.workflow_type,
+        claimed.chain_depth + 1,
+    )
+    await redis.xack(stream_name, _GROUP_NAME, message_id)
 
 
 def _log_if_failed(task: asyncio.Task[None]) -> None:
@@ -225,6 +327,7 @@ async def run_forever(
     max_retries: int,
     retry_base_seconds: float,
     retry_cap_seconds: float,
+    max_chain_depth: int,
     batch_size: int,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -268,6 +371,7 @@ async def run_forever(
                 max_retries=max_retries,
                 retry_base_seconds=retry_base_seconds,
                 retry_cap_seconds=retry_cap_seconds,
+                max_chain_depth=max_chain_depth,
             )
         )
         in_flight.add(task)

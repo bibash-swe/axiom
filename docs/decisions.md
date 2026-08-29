@@ -387,6 +387,83 @@ second measured the previous trial's refund. None failed loudly; all three
 would have been believed. Validate the instrument against a known quantity
 before trusting what it says about an unknown one.
 
+## 16. Composition: a handler returns its successor, written in one transaction
+
+**Decision:** A handler ends its workflow by returning a dict, or continues
+the chain by returning `NextStep(output=..., workflow_type=..., input_data=...)`.
+The worker completes the current row and creates the successor row plus its
+outbox event inside a single Postgres transaction. The successor is an
+ordinary workflow — its own id, lease, retry budget and dead-letter ceiling —
+linked to its parent by `parent_workflow_id` and `chain_depth` (migration 003).
+
+**Why a return value rather than a `submit_next()` call a handler makes:**
+An explicit call is a second write the handler could make and then crash
+before its own completion committed, or commit after being fenced out. As a
+return value, the handler cannot separate the two: there is exactly one
+transaction, and it either completes the parent and creates the successor or
+does neither. This is decision #13 finally implemented rather than described.
+
+**Why one transaction is not negotiable:** completing the parent and
+dispatching the successor as two writes leaves a window where a crash ends the
+chain *silently*. The parent reads `COMPLETED`, the caller sees a successful
+workflow, and the remaining steps never run. No reconciliation pass could ever
+detect that, because a `COMPLETED` row with no successor is exactly what the
+last step of a healthy chain looks like.
+
+**Why three statements instead of one CTE,** unlike `_SCHEDULE_RETRY`: the
+outbox payload must carry the successor's id, which does not exist until the
+successor is inserted. Generating it with `jsonb_build_object` would put a
+second, hand-typed copy of the `WorkflowStartedEvent` shape outside
+`contracts/` — the drift that package exists to prevent (#2). The transaction
+gives the same atomicity.
+
+**Why the successor's idempotency key is derived, and why `chain:` is
+reserved:** the key is `chain:<parent_id>:<workflow_type>`, so a chain write
+that ever runs twice collides with itself and becomes a no-op instead of
+forking the chain. That makes the prefix load-bearing, so a database `CHECK`
+rejects it for any row without a parent — otherwise a client could submit a
+key matching a chain step about to be created and silently take its place.
+Ingress is not the only writer of this table, so the constraint belongs at the
+database, next to `chk_status`.
+
+**Why the successor inherits `workflow_version`:** the Relay routes to
+`workflow_stream_{workflow_version}`, so a successor on a different version
+publishes to a stream the current fleet is not consuming and the chain stalls
+with no error anywhere. Inheriting also keeps cordon-and-drain meaningful: a
+chain finishes on the version it started on.
+
+**Why a depth ceiling, and why exceeding it fails loudly:** `max_retries`
+does not bound a chain — every link is a new workflow with a fresh budget — so
+a handler that always chains loops indefinitely, spending real money. The
+ceiling is the only thing that stops it. A workflow that hits it is marked
+`FAILED` with its handler's output still recorded, rather than completed with
+the successor quietly dropped: silent truncation would be indistinguishable
+from a chain that genuinely ended, and nobody would learn the rest of the work
+never ran.
+
+**What was measured before any of this was written.** Eight Postgres
+mechanics were checked against the real PG 18.4 instance in the exact shape
+the code uses, not inferred: `ADD COLUMN NOT NULL DEFAULT` did not rewrite a
+5000-row table (same `pg_relation_filenode` before and after); the reserved
+prefix `CHECK` accepts and rejects exactly the four intended cases; the
+worst-case derived key is 143 characters against `VARCHAR(255)`; `xmax = 0`
+flags the replay and leaves the original row untouched in the successor-insert
+shape specifically; a fenced-out writer's transaction leaves **no** successor
+and **no** orphan outbox row; a replayed chain write yields exactly one
+successor and one event; two connections racing the same derived key produce
+one row and one winner with no serialization error to handle.
+
+**And the tests were then checked against themselves.** Eight mutations were
+introduced one at a time — dropping version inheritance, skipping the outbox
+insert, removing the fence from the parent update, randomizing the successor
+key, an off-by-one in the depth ceiling, completing instead of failing at the
+ceiling, leaving the parent claimable, and letting the claim ignore current
+status — and each one was caught by a named test. A green suite that stays
+green while the guarantee is broken is the failure mode this project has
+already hit three times (#15); it is cheaper to check than to trust.
+
+---
+
 ## Known open items
 - **Poison-pilled outbox rows have no retention path:** Once `retry_count` 
   crosses `max_retries`, a `workflow_outbox` row sits permanently at 

@@ -22,6 +22,7 @@ import asyncio
 import logging
 import random
 from collections.abc import AsyncIterator, Coroutine
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -55,6 +56,26 @@ class NonRetryableError(Exception):
     The cost of that default is bounded: a deterministic bug is retried
     max_retries times and then dead-lettered, not forever.
     """
+
+
+@dataclass(frozen=True)
+class NextStep:
+    """A handler result that completes this step and hands off to another one.
+
+    Returning a plain dict ends the workflow; returning this continues the
+    chain. Both halves matter and both are written together: `output` is
+    persisted as this workflow's own output_data exactly as a plain return
+    would be, and the successor is created in the same transaction.
+
+    The successor is an ordinary workflow row with its own id, lease, retries
+    and dead-letter budget — not a checkpoint inside this one. That is
+    decision #13 made concrete: a chain is composed of atomic steps, so a step
+    that is reclaimed re-runs only itself, never the steps before it.
+    """
+
+    output: dict[str, Any]
+    workflow_type: str
+    input_data: dict[str, Any]
 
 
 def retry_delay_seconds(attempt: int, *, base_seconds: float, cap_seconds: float) -> float:
