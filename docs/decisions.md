@@ -553,9 +553,26 @@ suggests it is not an industry standard either:
 | OpenAI | Not documented for chat completions | Official Node SDK README documents automatic retries but no idempotency mechanism; `Idempotency-Key` appears only on the Agentic Commerce API |
 | xAI (Grok) | Not documented | Chat completions reference documents only `Content-Type` and `Authorization` |
 
-Only the Mistral row is a measurement. The rest is documentation, and this
-probe's whole point is that absence from documentation is not absence of
-behaviour — Mistral's own docs were silent too, and it took an experiment to
+The official SDKs corroborate the documentation, and more strongly than it
+does. Both `anthropic-sdk-python` and `openai-node` are Stainless-generated and
+carry the generator's generic idempotency scaffolding — and both leave it
+switched off. Anthropic's Python client sets `self._idempotency_header = None`
+and attaches the header only `if idempotency_header and idempotency_key`, so it
+never attaches one; `openai-node` declares `protected idempotencyHeader?:
+string`, never assigns it, and its `if (this.idempotencyHeader ...)` branch is
+dead. The capability is plumbed and deliberately not enabled, which is a
+clearer signal than silence in a docs page.
+
+The one place OpenAI *does* enable it is Agentic Commerce, and the primary
+source is explicit that this covers checkout `create` and `complete` calls —
+"safe duplicate requests return the same result. Parameter mismatches return
+`idempotency_conflict` with HTTP 409". That is payment idempotency in the
+Stripe tradition, protecting a discrete transaction. It does nothing for token
+generation, which is the thing that costs us money here.
+
+Only the Mistral row is a measurement. The rest is documentation and SDK
+source, and this probe's whole point is that absence from documentation is not
+absence of behaviour — Mistral's own docs were silent too, and it took an experiment to
 turn that silence into a fact. The script now takes `PROBE_BASE_URL`,
 `PROBE_MODEL` and `PROBE_API_KEY` so any OpenAI-compatible provider can be
 measured the moment a key exists. Until then those three rows are marked "not
