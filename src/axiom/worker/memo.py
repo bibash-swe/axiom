@@ -128,6 +128,14 @@ async def memoized_call(
     guard turns that from a silent wrong answer into
     NonDeterministicHandlerError.
 
+    It also has to be unique *within* a run, and that half is not guarded.
+    Two different calls at the same index are caught by the fingerprint, but
+    two *identical* calls at the same index are indistinguishable from a
+    replay, so the second returns the first's response and is never made.
+    A handler sampling one prompt twice must therefore give the two calls
+    different indices; the natural implementation, a counter incremented on
+    every call the handler makes, does this for free.
+
     request is anything JSON-serializable that fully identifies the call —
     in practice the provider request body. It is never stored, only hashed.
 
@@ -162,13 +170,33 @@ async def memoized_call(
 
     response = await call()
 
+    # Serialize before touching the database. The provider has already been
+    # paid by this point, so a response that cannot be stored is not an
+    # ordinary encoding error — it is money spent that this module has just
+    # failed to protect, and it must say so rather than surface as a TypeError
+    # from somewhere inside asyncpg. Non-retryable because another attempt
+    # would pay again and fail again in exactly the same place.
+    try:
+        serialized = json.dumps(response)
+    except (TypeError, ValueError) as exc:
+        logger.error(
+            "paid response at call_index=%d for workflow_id=%s is not JSON-serializable "
+            "and cannot be memoized — this call will be paid for again if the workflow re-runs",
+            call_index,
+            workflow_id,
+        )
+        raise NonRetryableError(
+            f"handler returned a non-serializable response at call_index={call_index} "
+            f"for workflow_id={workflow_id}: {exc}"
+        ) from exc
+
     async with pool.acquire() as conn:
         inserted = await conn.fetchrow(
             _INSERT_MEMO,
             workflow_id,
             call_index,
             fingerprint,
-            json.dumps(response),
+            serialized,
             lease_generation,
         )
 

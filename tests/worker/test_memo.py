@@ -22,6 +22,7 @@ from redis.asyncio import Redis
 from axiom.contracts.enums import WorkflowStatus
 from axiom.ingress.repository import submit_workflow
 from axiom.relay.runner import run_forever as relay_run_forever
+from axiom.worker.execution import NonRetryableError
 from axiom.worker.memo import NonDeterministicHandlerError, memoized_call
 from axiom.worker.runner import HandlerRegistry
 from axiom.worker.runner import run_forever as worker_run_forever
@@ -243,6 +244,30 @@ async def test_a_failed_call_is_not_memoized(
     )
     assert result["content"] == "second attempt"
     assert attempts == 2
+
+
+async def test_an_unstorable_response_fails_loudly_rather_than_as_a_type_error(
+    pool: asyncpg.Pool, memo_workflow: Callable[..., Awaitable[UUID]]
+) -> None:
+    """A paid response that cannot be stored is a priced failure, not an encoding bug.
+
+    The call has already been billed when this is discovered, so it must not
+    surface as a TypeError from inside asyncpg with no indication that money
+    was involved — and it must not be retried, because the next attempt pays
+    again and fails identically.
+    """
+    workflow_id = await memo_workflow()
+
+    async def unstorable() -> dict[str, Any]:
+        return {"content": object()}  # type: ignore[dict-item]
+
+    with pytest.raises(NonRetryableError, match="non-serializable"):
+        await memoized_call(
+            pool, workflow_id=workflow_id, lease_generation=1, call_index=0,
+            request={"prompt": "x"}, call=unstorable,
+        )
+
+    assert await _memo_rows(pool, workflow_id) == []
 
 
 async def test_a_fenced_worker_still_records_what_it_spent(
