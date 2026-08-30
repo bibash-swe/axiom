@@ -154,7 +154,21 @@ write, unless perfectly guarded). The Relay's only existing write to this
 table is the terminal, race-free `DISPATCH_FAILED` transition, which is
 safe specifically because a row that never dispatched can never be
 claimed by a worker — there's no contest possible. `QUEUED` doesn't have
-that property. If dispatch visibility is ever needed, read it from
+that property.
+
+> **Correction, August 2026 (see #20).** The clause above — "a row that
+> never dispatched can never be claimed by a worker" — is wrong, and it
+> was load-bearing. A publish that times out client-side but lands
+> server-side is recorded here as a failure while a worker consumes the
+> message normally; enough of those and the Relay stamped
+> `DISPATCH_FAILED` over a workflow that was already `RUNNING` or
+> `COMPLETED`. That ambiguous failure is the exact case this engine
+> exists to survive, so it could not be reasoned away. `settle_failures`
+> now carries an explicit `status = 'PENDING'` guard and migration 005
+> enforces the same thing structurally. The conclusion of this decision —
+> reject `QUEUED`, keep the Relay's write surface minimal — still stands,
+> and stands more firmly: the reasoning was too generous to a write the
+> Relay makes to a table it does not own. If dispatch visibility is ever needed, read it from
 `workflow_outbox.dispatched` instead of widening the state machine's
 write surface.
 
@@ -694,6 +708,83 @@ property of an operator's crash and stall rate, not of this code, so the honest
 framing of the memo's value is the one used above: it is *per-event* savings of
 a known size, times a rate nobody here has measured. That distinction is why
 neither this entry nor the README attaches a dollar figure.
+
+## 20. The state machine is enforced by the database, not by convention
+
+**Decision:** Migration 005 makes the state machine an object Postgres
+enforces. Two reference tables — `workflow_statuses` (the vocabulary, with
+`is_terminal` and `is_implemented`) and `workflow_state_transitions` (the six
+legal status changes, each naming the component that performs it) — plus a
+`BEFORE UPDATE ... FOR EACH ROW` trigger that refuses anything absent from the
+table.
+
+**The problem.** #7 chose the nine-state vocabulary but never wrote down which
+transitions between those states are legal, so there was nothing to enforce
+even in principle. `chk_status` constrains the *values* a column may hold, not
+the *edges* between them. Demonstrated before the migration:
+
+```
+INSERT ... status='COMPLETED';
+UPDATE workflow_states SET status='RUNNING' WHERE id = ...;   -- succeeded
+```
+
+Every safety property in this engine rested on each query carrying the right
+predicate. The worker's claim does, correctly. But that is a convention held by
+five queries and by whoever writes the sixth, and it is the kind of thing that
+survives review right up until it doesn't.
+
+**What it found immediately.** The Relay's `settle_failures` had no status
+predicate, and #7's justification for that — quoted and corrected above — does
+not hold. A publish that times out client-side but lands server-side counts as
+a failure here while a worker consumes the message; past `max_retries` the
+Relay stamped `DISPATCH_FAILED` over a workflow that had already completed. It
+now guards on `status = 'PENDING'`, so the wrong write affects zero rows, and
+the trigger enforces the same thing if that line is ever removed. This bug was
+not found by reading the code, which had been reviewed several times — it was
+found by being forced to write down the legal edges.
+
+**Verified exhaustively, not by sampling.** The transition space is 9 × 9 = 81
+ordered pairs, which is finite and therefore coverable, so
+`tests/contracts/test_state_machine.py` covers all of it: every cell attempted
+against a real row and compared with an expectation derived independently from
+the six status writes in `src/`, not read back from the migration. A test that
+asked the table what to expect could only prove the trigger agrees with the
+table, never that the table is right. Seven mutations of the enforcement itself
+— trigger dropped, `WHEN` clause removed, function failing open, a terminal
+state given an escape route, a legal transition deleted, `is_terminal` flipped,
+the Relay guard removed — were all caught by named tests.
+
+**Two mechanics verified against primary sources rather than memory,** both
+load-bearing:
+
+- The trigger's `WHEN (OLD.status IS DISTINCT FROM NEW.status)` is what keeps
+  the ingress idempotent write working. PostgreSQL 18's `CREATE TRIGGER`
+  documentation is explicit that "an `INSERT` with an `ON CONFLICT DO UPDATE`
+  clause may cause both insert and update operations, so it will fire both
+  kinds of triggers as needed" — so a resubmitted idempotency key *does* reach
+  this trigger, on a row in whatever state it already holds, terminal included.
+  It survives only because the conflict update rewrites `idempotency_key` and
+  never touches `status`. Had this been assumed rather than checked, #8's
+  idempotency guarantee would have broken on every resubmission of a finished
+  workflow.
+- `RAISE ... USING ERRCODE = '23514'` is `check_violation` per the error-codes
+  appendix, which is what makes asyncpg raise `CheckViolationError` and lets
+  the tests distinguish a refused transition from an unrelated failure.
+
+**What is deliberately not enforced.** The status a row is *born* with. An
+`INSERT` is not a transition, and the test fixtures construct rows directly in
+`RUNNING` and terminal states to reach scenarios that would otherwise need a
+full round trip. Both production insert paths write `PENDING`, asserted by test
+rather than by constraint.
+
+**The three unimplemented states stay unreachable.** `WAITING_FOR_INPUT`,
+`CANCELING` and `CANCELED` are reserved for the Phase 5 API — cancellation and
+human-in-the-loop resume — and have no transitions, so the trigger refuses
+every path into them until the phase that implements them adds the rows. Giving
+them edges now would be encoding a guess about a design that does not exist. It
+also means `is_terminal` cannot be derived for those three, only asserted; the
+test scopes its derivation to implemented states and says why, which is a
+distinction the first version of that test got wrong and the run caught.
 
 ---
 
