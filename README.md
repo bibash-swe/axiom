@@ -57,22 +57,38 @@ A superseded worker detects supersession between stream chunks and closes the
 transport. That much is proven: measured against a real socket and observed from
 the *server's* side, the close lands before the fencing error even surfaces.
 
-Two things are explicitly **not** established, and are not claimed:
-- Whether a given LLM provider actually stops generating — and stops billing —
-  once we disconnect. That is a property of someone else's infrastructure, it
-  varies by provider, and it is only measurable per-provider against a real one.
-- Fencing does **not** stop a *reclaiming* worker from issuing a second paid
-  call. Because a reclaimed workflow re-runs its handler from the start (see
-  `docs/decisions.md` #13), a stalled-then-reclaimed workflow can bill twice.
-  This page previously said the fix was provider-side idempotency keys. That
-  was measured in August 2026 and is wrong: Mistral ignores `Idempotency-Key`
-  entirely — a replayed request regenerates, with a new response id and a full
-  token charge, behaving exactly like a header the API does not recognise.
-  Anthropic, OpenAI and xAI document no equivalent for chat completions either.
-  Worse, OpenAI's own SDK retries 409/429/5xx twice by default with nothing
-  deduplicating them. Closing this gap therefore cannot depend on provider
-  cooperation, and needs a mechanism we own — see `docs/decisions.md` #18 for
-  the measurement and the design it points to. Not yet implemented.
+One thing is explicitly **not** established, and is not claimed: whether a given
+LLM provider actually stops generating — and stops billing — once we
+disconnect. That is a property of someone else's infrastructure, it varies by
+provider, and it is only measurable per-provider against a real one.
+
+**✅ Pay once per call across re-runs — built and measured.**
+Fencing stops a *superseded* worker from generating more tokens. It does
+nothing about the *reclaiming* one, which re-runs the handler from the start
+(`docs/decisions.md` #13) and re-issues every call the previous attempt already
+paid for. This page used to name provider-side idempotency keys as the fix.
+That was measured in August 2026 and is wrong — Mistral ignores
+`Idempotency-Key` entirely, and no major provider documents an equivalent for
+chat completions (`docs/decisions.md` #18) — so the record lives here instead.
+A handler wraps each paid call in `memoized_call()`; the response is committed
+to Postgres keyed by `(workflow_id, call_index)` and every later attempt reads
+it back rather than calling out. Measured end to end against a real provider,
+a workflow that fails twice after paying and then succeeds costs **206 tokens
+without the memo and 61 with it** — three attempts, one bill.
+
+The write is deliberately **unfenced**, unlike every other write in this
+system: a superseded worker must still record what it spent, because the memo
+the winner reads is usually the one the loser wrote.
+
+It **narrows** the window rather than closing it, and is described that way on
+purpose. A worker that dies between the provider committing the charge and the
+memo committing still pays twice; that window is one Postgres write, measured
+at p50 1.2ms / p95 1.8ms against a ~2.8s completion. Nor does it help two
+workers running genuinely at once — only the sequential re-run reclaim
+produces. It also
+requires handlers to issue their calls in the same order every run; a handler
+that breaks that assumption gets a loud `NonDeterministicHandlerError` rather
+than a wrong answer.
 
 **⬜ Anti-entropy — designed, not built (Phase 4).**
 The reconciliation sweep is specified, and deliberately scoped so the Janitor

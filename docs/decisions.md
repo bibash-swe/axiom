@@ -610,6 +610,91 @@ handler issues its calls in the same order every run — which is a real
 constraint on handler authors and belongs in the public contract, not in a
 comment.
 
+## 19. Completion memos: the engine pays once per call, because nobody else will
+
+**Decision:** A handler wraps each paid provider call in
+`memoized_call()` (`src/axiom/worker/memo.py`), which performs the call once
+per `(workflow_id, call_index)` and returns the committed response on every
+later run. Migration 004 adds `workflow_call_memos`.
+
+This is what #18 pointed at, built. It is not new scope: it closes the gap the
+README's cost-safety section has been carrying as unresolved since Phase 3,
+after #18 established that the remedy that section originally named does not
+exist. It lives in `worker/` rather than a new package for the same reason
+`stream_guard` does — it is an execution primitive handlers call with the
+fencing context the runner already passes them, not a provider integration.
+
+**What it is worth, measured.** The engine half is a call counter against a
+fake provider (`tests/worker/test_memo.py`); the money half is a real workflow
+that fails twice after paying and then succeeds, run end to end through a real
+Relay and Worker against `mistral-small-latest`
+(`scripts/memo_double_bill_probe.py`, August 2026):
+
+```
+run            status      handler runs  paid calls   tokens
+without memo   COMPLETED              3           3      206
+with memo      COMPLETED              3           1       61
+```
+
+Three attempts, one bill. The residual exposure was measured too, because #18
+promised the memo would shrink the window "to a single Postgres write" without
+ever saying how big that is (`scripts/memo_write_window_probe.py`, n=300,
+loopback, `fsync`/`synchronous_commit`/`full_page_writes` all on, 931-byte
+response):
+
+```
+write (residual window)  p50  1.235ms  p95  1.750ms  max 14.456ms
+miss  (cost per call)    p50  0.423ms  p95  0.617ms  max  1.919ms
+```
+
+Against a ~2.8s completion, that turns "every reclaim re-bills" into "a reclaim
+re-bills if the crash lands in roughly one part in 2,300" — and one part in
+1,600 at p95, which is the number to quote when the question is risk rather
+than average. The 14ms outlier is one sample in 300 and is left in rather than
+trimmed, because the worst case is what a window claim is actually about.
+Smaller, not zero, and it should never be described as zero. The miss figure is
+the other side of the trade: every call that is *not* a replay pays ~0.4ms for
+the lookup that finds nothing.
+
+**The fingerprint is a guard, never part of the key.** A handler may
+legitimately issue the identical request twice — two samples from one prompt is
+the obvious case — so keying on content would silently collapse a deliberate
+second call into a replay of the first. Keying on `call_index` keeps them
+distinct; hashing the request and comparing on read is what catches the
+opposite error, a handler that reaches the same index with a *different* call.
+That raises `NonDeterministicHandlerError` (non-retryable) rather than
+returning the memo, because the two alternatives are worse: serving it answers
+a question the handler did not ask, and ignoring it reintroduces the double
+bill.
+
+**Failures are deliberately not memoized,** which leaves the one hole this
+design cannot close. A call that raised may or may not have been billed — a
+connection dropped after the provider committed the charge looks identical from
+here to one that never landed — and memoizing failures would break ordinary
+retry, which is the mechanism this engine most depends on. Retrying a possibly-
+billed call is the cheaper wrong answer than never retrying a genuinely failed
+one.
+
+**On losing the insert race,** the caller returns the *stored* response, not
+its own. Both were paid for and that money is gone either way, but only one can
+be what the workflow observed on every future run; preferring our own would
+make the handler's view depend on which attempt happened to be executing.
+
+**Tests were checked by mutation,** as #16's were. Eight edits that each
+silently reintroduce a double bill or a wrong answer — `DO NOTHING` relaxed to
+`DO UPDATE`, the fingerprint guard removed, the memo read fenced like every
+other worker read, failures memoized, `sort_keys` dropped — were all caught,
+each by a test whose name describes the property it lost.
+
+**What is still not known: how often this actually fires.** The natural
+question — what fraction of workflows are re-executed — is a query away
+(`lease_generation > 1`), and it returns nothing, because this project has no
+production traffic and the local database is transient. Reclaim frequency is a
+property of an operator's crash and stall rate, not of this code, so the honest
+framing of the memo's value is the one used above: it is *per-event* savings of
+a known size, times a rate nobody here has measured. That distinction is why
+neither this entry nor the README attaches a dollar figure.
+
 ---
 
 ## Known open items
@@ -641,3 +726,19 @@ comment.
   or GIL contention under load — both plausible causes of a
   false-positive fencing event that would be self-inflicted rather than
   infrastructure-caused.
+- **Completion memos have no retention path.** `workflow_call_memos` cascades
+  when its workflow is deleted, so it inherits whatever retention
+  `workflow_states` eventually gets — and `workflow_states` has none either. A
+  memo stops being useful the moment its workflow reaches a terminal state, and
+  it stores a whole provider response, so this table grows faster in bytes than
+  anything else in the schema. Deleting on completion was rejected for now
+  because it puts an extra write on the hot path to reclaim space no one is
+  short of yet; the right fix is one retention job covering all three cases
+  (dispatched outbox rows, poison-pilled outbox rows, terminal workflows and
+  their memos) rather than three separate sweeps.
+- **Migrations are applied by hand.** `docker compose up` only auto-applies
+  `migrations/` when it creates the volume, so 003 and 004 were run manually
+  against an existing database. There is no runner, no record of which
+  migrations a given database has, and nothing that would catch a partially
+  migrated environment — a real operational gap now that migrations have
+  outlived a single fresh boot.
