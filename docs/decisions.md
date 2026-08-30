@@ -771,11 +771,40 @@ load-bearing:
   appendix, which is what makes asyncpg raise `CheckViolationError` and lets
   the tests distinguish a refused transition from an unrelated failure.
 
+**Cost, since this repo does not get to assert one.** The trigger fires on
+every `PENDING -> RUNNING`, which is `claim_workflow` — the hottest path in the
+engine. Measured over 300 claims against a warm pool: p50 1.663ms with the
+trigger against 1.589ms without, so **+0.074ms, or +4.7%**, for a PL/pgSQL
+invocation and a primary-key lookup. Acceptable, but it was shipped unmeasured
+in the first version of this entry and that was the wrong way round.
+
 **What is deliberately not enforced.** The status a row is *born* with. An
 `INSERT` is not a transition, and the test fixtures construct rows directly in
 `RUNNING` and terminal states to reach scenarios that would otherwise need a
 full round trip. Both production insert paths write `PENDING`, asserted by test
 rather than by constraint.
+
+**Two limits that keep the word "structural" honest.**
+
+The transition table is ordinary data owned by the role the application
+connects as, so `INSERT INTO workflow_state_transitions VALUES
+('COMPLETED','RUNNING',...)` widens what the trigger permits — verified, it
+succeeds. So this is not "illegal transitions are impossible"; it is "illegal
+transitions are no longer reachable by writing an ordinary query wrong", which
+is the failure mode that actually existed and the one that produced the Relay
+bug. Tampering is *detected* rather than prevented, by the test that asserts
+the table's contents against an independently derived set. Prevention needs a
+migration role distinct from the application role, which this project does not
+have and which is a bigger change than this one.
+
+The table is also not a complete description of the state machine, because
+`chk_no_self_transition` forbids recording `RUNNING -> RUNNING`. That edge is
+real — it is a reclaim, with `lease_generation` incremented — and it is
+deliberately absent, since the trigger's `WHEN` clause means a write that does
+not change status is never a transition and is guarded by the lease instead.
+The table describes every status *change*; the reclaim is a change of owner.
+Worth keeping straight, because "the table is the specification" is close
+enough to true to mislead.
 
 **The three unimplemented states stay unreachable.** `WAITING_FOR_INPUT`,
 `CANCELING` and `CANCELED` are reserved for the Phase 5 API — cancellation and
@@ -827,6 +856,17 @@ distinction the first version of that test got wrong and the run caught.
   short of yet; the right fix is one retention job covering all three cases
   (dispatched outbox rows, poison-pilled outbox rows, terminal workflows and
   their memos) rather than three separate sweeps.
+- **`ON DELETE CASCADE` on memos destroys the record of money spent.** Migration
+  004 justified the cascade with "a memo has no meaning without its workflow",
+  which is true of its *function* — replaying a call needs the workflow that
+  makes the call — and false of its *value as an audit record*. Deleting a
+  workflow row currently removes, silently and with no trace, the evidence of
+  what a provider was paid. Nothing deletes workflow rows today, so this is
+  latent rather than active, but the retention job above is exactly the thing
+  that would trip it, and it should be settled before that job is written
+  rather than discovered by it. The options are to keep the cascade and have
+  retention archive memos first, or to break the FK and let memos outlive their
+  workflow as standalone receipts.
 - **Migrations are applied by hand.** `docker compose up` only auto-applies
   `migrations/` when it creates the volume, so 003 and 004 were run manually
   against an existing database. There is no runner, no record of which

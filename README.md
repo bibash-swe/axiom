@@ -90,7 +90,7 @@ requires handlers to issue their calls in the same order every run; a handler
 that breaks that assumption gets a loud `NonDeterministicHandlerError` rather
 than a wrong answer.
 
-**✅ Illegal state transitions are impossible — enforced at the database.**
+**✅ Illegal state transitions are refused by the database — with one honest limit.**
 The nine-state vocabulary was always constrained; the *edges between* those
 states were not. Until migration 005, `UPDATE workflow_states SET
 status='RUNNING'` on a `COMPLETED` row succeeded, and safety rested on every
@@ -98,6 +98,15 @@ query being written with the right predicate. The legal transitions now live in
 `workflow_state_transitions` as data — six of them, each naming the component
 that performs it — and a trigger refuses anything else, including all 40
 transitions out of a terminal state.
+
+The limit, stated rather than glossed: the transition table is ordinary data,
+and the application connects as the same role that owns it, so an `INSERT` into
+that table would widen what the trigger permits. This is not "impossible", it
+is *"no longer reachable by writing an ordinary query wrong"* — which was the
+actual failure mode. Tampering is caught rather than prevented: a test asserts
+the table's exact contents against a set derived independently from the code.
+Making it genuinely unwriteable needs a separate migration role, which this
+project does not yet have.
 
 Writing the edges down immediately found a real bug: the Relay could stamp
 `DISPATCH_FAILED` over an already-`COMPLETED` workflow, because a publish that
