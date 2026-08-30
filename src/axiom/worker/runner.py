@@ -41,6 +41,7 @@ from axiom.worker.execution import (
 from axiom.worker.worker import (
     ClaimedWorkflow,
     claim_workflow,
+    is_settled,
     schedule_retry,
     settle_and_chain,
     settle_terminal,
@@ -117,9 +118,23 @@ async def process_message(
         pool, workflow_id=workflow_id, worker_id=worker_id, lease_seconds=lease_seconds
     )
     if claimed is None:
-        # Already handled by someone else, or a genuine duplicate delivery
-        # of an already-claimed, still-fresh-leased row. Safe no-op.
-        await redis.xack(stream_name, _GROUP_NAME, message_id)
+        # Two very different situations, and acking both loses work. The
+        # workflow is either finished — nothing to do, ack — or still RUNNING
+        # under someone else's live lease. XAUTOCLAIM measures how long a
+        # message has sat in the PEL, which heartbeats do not reset, so any
+        # workflow outliving xautoclaim_min_idle_seconds gets its message
+        # handed to a second worker while the first is perfectly healthy.
+        # Acking there deletes the only thing that could redeliver the work,
+        # and the row strands in RUNNING if the original worker then dies.
+        # Leaving it unacked costs a re-reclaim later and nothing else.
+        if await is_settled(pool, workflow_id):
+            await redis.xack(stream_name, _GROUP_NAME, message_id)
+        else:
+            logger.info(
+                "workflow_id=%s is still owned by a live lease; leaving message %s unacked",
+                workflow_id,
+                message_id,
+            )
         return
 
     try:

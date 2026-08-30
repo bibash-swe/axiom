@@ -155,6 +155,27 @@ async def claim_workflow(
     )
 
 
+_IS_TERMINAL = """
+    SELECT s.is_terminal
+    FROM workflow_states w
+    JOIN workflow_statuses s ON s.status = w.status
+    WHERE w.id = $1
+"""
+
+
+async def is_settled(pool: asyncpg.Pool, workflow_id: UUID) -> bool:
+    """Whether this workflow has reached a terminal status, or no longer exists.
+
+    Reads is_terminal from workflow_statuses (migration 005) rather than
+    carrying a second copy of the terminal set here. A missing row counts as
+    settled: there is nothing left to run, and holding its message forever
+    would leak it.
+    """
+    async with pool.acquire() as conn:
+        terminal = await conn.fetchval(_IS_TERMINAL, workflow_id)
+    return terminal is not False
+
+
 async def renew_lease(
     pool: asyncpg.Pool, *, workflow_id: UUID, lease_generation: int, lease_seconds: int
 ) -> bool:
