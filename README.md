@@ -120,6 +120,25 @@ attempted against a real row and checked against an expectation derived
 independently of the migration. Seven mutations of the enforcement itself were
 all caught. See `docs/decisions.md` #20.
 
+**✅ The protocol is model-checked exhaustively — and it found a real bug.**
+`src/axiom/worker/protocol_model.py` states claim/fence/settle/ack as a finite
+state machine; the tests enumerate every reachable state by BFS and check four
+safety invariants at each one. Not TLA+: TLC needs a JVM this stack does not
+have, and verifies a model rather than the code. So the checker is fed
+deliberately broken protocols and must find them, and the model's claim
+predicate is cross-checked against real Postgres so it cannot drift from the SQL.
+
+It found a bug that 162 tests, mutation testing and several reviews had missed.
+`XAUTOCLAIM`'s idle timer measures how long a message sat unacked in the PEL,
+and heartbeats do not reset it — they extend the Postgres lease, a different
+clock. With the shipped settings, **every workflow running longer than 35
+seconds** had its message handed to a second worker, whose claim then failed
+against the live lease and acked it as a duplicate. That destroyed the only
+thing that could redeliver the work. No crash was needed to set it up, only to
+expose it. Reproduced against real Postgres and Redis, then fixed: a failed
+claim now acks only if the workflow is genuinely settled. See
+`docs/decisions.md` #21.
+
 **⬜ Anti-entropy — designed, not built (Phase 4).**
 The reconciliation sweep is specified, and deliberately scoped so the Janitor
 never writes `workflow_states` at all — its only power is force-`ACK`ing a Redis

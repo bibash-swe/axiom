@@ -815,6 +815,57 @@ also means `is_terminal` cannot be derived for those three, only asserted; the
 test scopes its derivation to implemented states and says why, which is a
 distinction the first version of that test got wrong and the run caught.
 
+## 21. Exhaustive model checking, in Python, and the bug it found
+
+**Decision:** `src/axiom/worker/protocol_model.py` states the
+claim/fence/settle/ack protocol as a finite state machine.
+`tests/worker/test_protocol_model.py` enumerates every reachable state by BFS
+and checks four safety invariants at each one.
+
+**Why not TLA+.** TLC is the standard tool and it needs a JVM, which this stack
+does not have. It also verifies a model, not the code — the usual criticism, and
+a bad fit for a repo that tests against real Postgres and Redis. Exhaustive BFS
+over a bounded model is a few hundred lines of Python and gives the same
+guarantee for safety. What it gives up is liveness under fairness, which TLC
+does well and this does not do at all.
+
+Two things stop it being theatre. The checker is fed deliberately broken
+protocols and must find them — a checker that has never reported a violation is
+not known to be able to. And the model's claim predicate is cross-checked
+against real Postgres, so it cannot drift from the SQL it claims to mirror.
+
+**The bug.** Modelling `process_message` faithfully means modelling what it does
+when `claim_workflow` returns None: it acks. The model immediately produced a
+7-step counterexample to `ack_implies_terminal`, reproduced against real
+Postgres and Redis in `tests/worker/test_stranded_message.py`:
+
+```
+deliver->w0 | w0 claim (gen 1) | tick | tick
+xautoclaim w0->w1 | w1 claim failed, acks as duplicate
+  -> message acked, workflow still RUNNING, nothing can redeliver it
+```
+
+`XAUTOCLAIM`'s `min_idle_time` measures how long a message has sat unacked in
+the PEL. Heartbeats do not reset it — they extend the Postgres lease, a
+different clock. So with the shipped settings (lease 30s, heartbeat 10s,
+XAUTOCLAIM 35s) **every workflow running longer than 35 seconds** has its
+message handed to a second worker, whose claim then fails against the live
+lease. The old code called that "a genuine duplicate delivery of an
+already-claimed, still-fresh-leased row. Safe no-op" and acked. It is not safe:
+the message is destroyed while the work is still in flight, and if the original
+worker then dies the row strands in `RUNNING` with nothing to redeliver it.
+Note the failure needs no crash to *set up* — only to be exposed.
+
+**The fix.** On a failed claim, ack only if the workflow is actually settled
+(`is_settled`, reading `is_terminal` from `workflow_statuses`). Otherwise leave
+the message in the PEL, where a later reclaim finds it. The cost is a repeated
+reclaim attempt while a long workflow runs; the alternative is losing the work.
+
+**What this says about the phases.** 162 tests, mutation testing, an exhaustive
+transition check and several code reviews did not find this. It needed a model
+of the protocol as a whole, because no single component is wrong — the Relay,
+the claim query and the ack rule are each individually correct.
+
 ---
 
 ## Known open items
@@ -828,17 +879,6 @@ distinction the first version of that test got wrong and the run caught.
   `relay.py` — `dispatched` must keep meaning "this actually reached 
   Redis," never "we gave up." Low urgency (poison-pills should be rare 
   in a healthy system) but a real gap, not yet built.
-- **The Relay tests silently assume a nearly-empty outbox.** `claim_batch` is
-  `ORDER BY created_at ASC LIMIT batch_size`, so a test that creates a row and
-  then claims a batch only finds it while fewer than `batch_size` older
-  undispatched rows exist. Hit for real while working on #18: scratch scripts
-  had left 104 undispatched rows, putting the new row at position 105, and
-  `test_settle_failures_dead_letters_at_max_retries` failed with an assertion
-  that looks like a Relay bug and is not. The tests are correct about the
-  Relay and wrong about their own isolation. Fix is for those tests to scope
-  their claim to their own `workflow_version` rather than trusting global
-  table state. Related to the outbox retention gap above — both are the same
-  underlying fact, that nothing ever removes an undispatched row.
 - **Heartbeat timing has never been tested under realistic concurrent
   process pressure.** The 10s heartbeat / 30s lease ratio gives a 3x
   margin against a single missed tick, but that ratio was chosen for
