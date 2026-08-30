@@ -42,6 +42,20 @@ _SETTLE_SUCCESS = """
 # Atomic: only rows that actually cross the retry threshold flip
 # workflow_states to terminal. A transient failure just releases its lease
 # for the next claim — it must never touch workflow_states.
+#
+# The `status = 'PENDING'` guard is not redundant. Decision #7 argued this
+# write was race-free because "a row that never dispatched can never be claimed
+# by a worker" — which is not airtight. A publish that times out client-side
+# but lands server-side is counted here as a failure while a worker consumes
+# the message perfectly happily; five of those and this statement would stamp
+# DISPATCH_FAILED over a workflow that is already RUNNING, or COMPLETED. That
+# ambiguous-failure case is precisely the one this engine exists to survive, so
+# it cannot be reasoned away.
+#
+# Guarding on PENDING makes the wrong write affect zero rows instead: if the
+# workflow has moved on, the dispatch "failure" was a lie and there is nothing
+# to terminalize. Migration 005 enforces the same thing structurally, so a
+# future edit that drops this line raises rather than corrupts.
 _SETTLE_FAILURES = """
     WITH failed_terminal AS (
         UPDATE workflow_outbox
@@ -52,6 +66,7 @@ _SETTLE_FAILURES = """
     UPDATE workflow_states
     SET status = 'DISPATCH_FAILED', error_log = $3::jsonb
     WHERE id IN (SELECT workflow_id FROM failed_terminal WHERE retry_count >= $4)
+      AND status = 'PENDING'
 """
 
 

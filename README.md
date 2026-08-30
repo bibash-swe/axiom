@@ -90,6 +90,36 @@ requires handlers to issue their calls in the same order every run; a handler
 that breaks that assumption gets a loud `NonDeterministicHandlerError` rather
 than a wrong answer.
 
+**✅ Illegal state transitions are refused by the database — with one honest limit.**
+The nine-state vocabulary was always constrained; the *edges between* those
+states were not. Until migration 005, `UPDATE workflow_states SET
+status='RUNNING'` on a `COMPLETED` row succeeded, and safety rested on every
+query being written with the right predicate. The legal transitions now live in
+`workflow_state_transitions` as data — six of them, each naming the component
+that performs it — and a trigger refuses anything else, including all 40
+transitions out of a terminal state.
+
+The limit, stated rather than glossed: the transition table is ordinary data,
+and the application connects as the same role that owns it, so an `INSERT` into
+that table would widen what the trigger permits. This is not "impossible", it
+is *"no longer reachable by writing an ordinary query wrong"* — which was the
+actual failure mode. Tampering is caught rather than prevented: a test asserts
+the table's exact contents against a set derived independently from the code.
+Making it genuinely unwriteable needs a separate migration role, which this
+project does not yet have.
+
+Writing the edges down immediately found a real bug: the Relay could stamp
+`DISPATCH_FAILED` over an already-`COMPLETED` workflow, because a publish that
+times out client-side but lands server-side counts as a dispatch failure while
+a worker consumes the message perfectly happily. Code review had not caught it;
+being forced to enumerate the legal edges did.
+
+The transition space is 9 × 9 = 81 ordered pairs — finite, so
+`tests/contracts/test_state_machine.py` covers **all of it**, each cell
+attempted against a real row and checked against an expectation derived
+independently of the migration. Seven mutations of the enforcement itself were
+all caught. See `docs/decisions.md` #20.
+
 **⬜ Anti-entropy — designed, not built (Phase 4).**
 The reconciliation sweep is specified, and deliberately scoped so the Janitor
 never writes `workflow_states` at all — its only power is force-`ACK`ing a Redis
