@@ -907,6 +907,17 @@ the claim query and the ack rule are each individually correct.
   rather than discovered by it. The options are to keep the cascade and have
   retention archive memos first, or to break the FK and let memos outlive their
   workflow as standalone receipts.
+- **Long workflows now inflate Redis' delivery counter.** #21's fix leaves a
+  message unacked while its workflow runs, so `XAUTOCLAIM` re-claims it every
+  `min_idle_time` and, per the Redis docs, increments the attempted-deliveries
+  count each time. The same docs name a high delivery count as the way to spot
+  a message consumers keep failing on — so a perfectly healthy 10-minute
+  workflow will look like a poison pill to that signal. Nothing reads it yet;
+  Phase 6 must not treat it as a fault indicator without also checking the row.
+- **The model covers one message and no retry path.** #21's state machine has no
+  `schedule_retry`, no Relay, and no chaining. The retry gap is the one that
+  matters: releasing to PENDING writes a *new* outbox row, so a workflow can
+  have two live stream messages, and that interleaving is unexplored.
 - **Migrations are applied by hand.** `docker compose up` only auto-applies
   `migrations/` when it creates the volume, so 003 and 004 were run manually
   against an existing database. There is no runner, no record of which
